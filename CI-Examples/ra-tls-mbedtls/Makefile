@@ -19,13 +19,13 @@ RA_CLIENT_LINKABLE ?= 0
 all: app epid  # by default, only build EPID because it doesn't rely on additional (DCAP) libs
 
 .PHONY: app
-app: ssl/server.crt mbedtls/.mbedtls_configured server.manifest.sgx server.sig server.token client
+app: ssl/server.crt server.manifest.sgx server.sig client
 
 .PHONY: epid
-epid: client_epid.manifest.sgx client_epid.sig client_epid.token
+epid: client_epid.manifest.sgx client_epid.sig
 
 .PHONY: dcap
-dcap: client_dcap.manifest.sgx client_dcap.sig client_dcap.token
+dcap: client_dcap.manifest.sgx client_dcap.sig
 
 ############################# SSL DATA DEPENDENCY #############################
 
@@ -37,49 +37,15 @@ ssl/server.crt: ssl/ca_config.conf
 	openssl req -new -key ssl/server.key -out ssl/server.csr -config ssl/ca_config.conf
 	openssl x509 -req -days 360 -in ssl/server.csr -CA ssl/ca.crt -CAkey ssl/ca.key -CAcreateserial -out ssl/server.crt
 
-############################# MBEDTLS DEPENDENCY ##############################
-
-# This download is done to get headers in include/, because we currently fail to provide the headers
-# (`pkg-config --cflags mbedtls_gramine` in the below CFLAGS line returns a non-existing directory).
-# TODO: install mbedtls_gramine headers during Gramine install, and use them in below CFLAGS line.
-
-MBEDTLS_VERSION ?= 3.2.1
-MBEDTLS_SRC ?= mbedtls-$(MBEDTLS_VERSION).tar.gz
-MBEDTLS_URI ?= \
-	https://github.com/ARMmbed/mbedtls/archive \
-	https://packages.gramineproject.io/distfiles
-MBEDTLS_HASH ?= 5850089672560eeaca03dc36678ee8573bb48ef6e38c94f5ce349af60c16da33
-
-ifeq ($(DEBUG),1)
-MBED_BUILD_TYPE=Debug
-else
-MBED_BUILD_TYPE=Release
-endif
-
-$(MBEDTLS_SRC):
-	../common_tools/download --output $@ $(foreach mirror,$(MBEDTLS_URI),--url $(mirror)/$(MBEDTLS_SRC)) --sha256 $(MBEDTLS_HASH)
-
-.SECONDARY: mbedtls/.mbedtls_downloaded
-mbedtls/.mbedtls_downloaded: $(MBEDTLS_SRC)
-	tar --touch -xzf $(MBEDTLS_SRC)
-	mv mbedtls-mbedtls-$(MBEDTLS_VERSION) mbedtls
-	touch $@
-
-.SECONDARY: mbedtls/.mbedtls_configured
-mbedtls/.mbedtls_configured: mbedtls/.mbedtls_downloaded
-	cd mbedtls && ./scripts/config.pl set MBEDTLS_CMAC_C MBEDTLS_ERROR_C
-	touch $@
-
 ######################### CLIENT/SERVER EXECUTABLES ###########################
 
-# TODO: use `$(shell pkg-config --cflags mbedtls_gramine)` instead of local mbedtls includes
-CFLAGS += -I./mbedtls/include
+CFLAGS += $(shell pkg-config --cflags mbedtls_gramine)
 LDFLAGS += -ldl -Wl,--enable-new-dtags $(shell pkg-config --libs mbedtls_gramine)
 
-server: src/server.c mbedtls/.mbedtls_configured
+server: src/server.c
 	$(CC) $< $(CFLAGS) $(LDFLAGS) -o $@
 
-client: src/client.c mbedtls/.mbedtls_configured
+client: src/client.c
 	$(CC) $< $(CFLAGS) $(LDFLAGS) -o $@
 
 ############################### SERVER MANIFEST ###############################
@@ -104,9 +70,6 @@ sgx_sign_server: server.manifest server
 		--manifest $< \
 		--output $<.sgx
 
-server.token: server.sig
-	gramine-sgx-get-token --output $@ --sig $<
-
 ########################### CLIENT (DCAP) MANIFEST ############################
 
 client_dcap.manifest: client.manifest.template
@@ -123,9 +86,6 @@ sgx_sign_client_dcap: client_dcap.manifest client
 	gramine-sgx-sign \
 		--manifest $< \
 		--output $<.sgx
-
-client_dcap.token: client_dcap.sig
-	gramine-sgx-get-token --output $@ --sig $<
 
 ########################### CLIENT (EPID) MANIFEST ############################
 
@@ -144,9 +104,6 @@ sgx_sign_client_epid: client_epid.manifest client
 		--manifest $< \
 		--output $<.sgx
 
-client_epid.token: client_epid.sig
-	gramine-sgx-get-token --output $@ --sig $<
-
 ############################### SGX CHECKS FOR CI #############################
 
 .PHONY: check_epid
@@ -164,7 +121,7 @@ check_epid: app epid
 
 .PHONY: check_epid_fail
 check_epid_fail: app epid
-	gramine-sgx server dummy-option >/dev/null & SERVER_ID=$$!; \
+	gramine-sgx server --test-malicious-quote >/dev/null & SERVER_ID=$$!; \
 	sleep 30; \
 	./client epid && exit 1 || echo "[ Success 1/1 ]"; \
 	kill -9 $$SERVER_ID
@@ -184,7 +141,7 @@ check_dcap: app dcap
 
 .PHONY: check_dcap_fail
 check_dcap_fail: app dcap
-	gramine-sgx server dummy-option >/dev/null & SERVER_ID=$$!; \
+	gramine-sgx server --test-malicious-quote >/dev/null & SERVER_ID=$$!; \
 	sleep 30; \
 	./client dcap && exit 1 || echo "[ Success 1/1 ]"; \
 	kill -9 $$SERVER_ID
@@ -198,4 +155,4 @@ clean:
 
 .PHONY: distclean
 distclean: clean
-	$(RM) -r mbedtls/ *.tar.gz ssl/ca.* ssl/server.*
+	$(RM) -r ssl/ca.* ssl/server.*

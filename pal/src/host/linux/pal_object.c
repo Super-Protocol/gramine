@@ -12,25 +12,34 @@
 #include "pal_internal.h"
 #include "pal_linux_error.h"
 
+/* To avoid expensive malloc/free (due to locking), use stack if the required space is small
+ * enough. */
+#define NFDS_LIMIT_TO_USE_STACK 16
+
 int _PalStreamsWaitEvents(size_t count, PAL_HANDLE* handle_array, pal_wait_flags_t* events,
                           pal_wait_flags_t* ret_events, uint64_t* timeout_us) {
     int ret;
     uint64_t remaining_time_us = timeout_us ? *timeout_us : 0;
 
-    if (count == 0)
-        return 0;
+    struct pollfd* fds = NULL;
+    bool allocate_on_stack = count <= NFDS_LIMIT_TO_USE_STACK;
 
-    struct pollfd* fds = calloc(count, sizeof(*fds));
-    if (!fds) {
-        return -PAL_ERROR_NOMEM;
+    if (allocate_on_stack) {
+        static_assert(sizeof(*fds) * NFDS_LIMIT_TO_USE_STACK <= 128,
+                      "Would use too much space on stack, reduce the limit");
+        fds = __builtin_alloca(count * sizeof(*fds));
+    } else {
+        fds = malloc(count * sizeof(*fds));
+        if (!fds) {
+            return -PAL_ERROR_NOMEM;
+        }
     }
+    memset(fds, 0, count * sizeof(*fds));
 
     for (size_t i = 0; i < count; i++) {
-        ret_events[i] = 0;
-
         PAL_HANDLE handle = handle_array[i];
         /* If `handle` does not have a host fd, just ignore it. */
-        if ((handle->flags & (PAL_HANDLE_FD_READABLE | PAL_HANDLE_FD_WRITABLE))
+        if (handle && (handle->flags & (PAL_HANDLE_FD_READABLE | PAL_HANDLE_FD_WRITABLE))
                 && handle->generic.fd != PAL_IDX_POISON) {
             short fdevents = 0;
             if (events[i] & PAL_WAIT_READ) {
@@ -77,6 +86,8 @@ int _PalStreamsWaitEvents(size_t count, PAL_HANDLE* handle_array, pal_wait_flags
     }
 
     for (size_t i = 0; i < count; i++) {
+        ret_events[i] = 0;
+
         if (fds[i].fd == -1) {
             /* We skipped this fd. */
             continue;
@@ -101,6 +112,8 @@ out:
     if (timeout_us) {
         *timeout_us = remaining_time_us;
     }
-    free(fds);
+    if (!allocate_on_stack) {
+        free(fds);
+    }
     return ret;
 }

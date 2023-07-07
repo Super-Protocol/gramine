@@ -1,4 +1,4 @@
-node('nonsgx_slave') {
+node('nonsgx_slave && aesni') {
     checkout scm
 
     load '.ci/lib/config-docker.jenkinsfile'
@@ -7,7 +7,6 @@ node('nonsgx_slave') {
         '-f .ci/ubuntu20.04.dockerfile .'
     ).inside("${env.DOCKER_ARGS_COMMON}") {
         load '.ci/lib/config.jenkinsfile'
-        load '.ci/lib/config-ubuntu20.04.jenkinsfile'
         load '.ci/lib/config-debug.jenkinsfile'
 
         load '.ci/lib/stage-lint.jenkinsfile'

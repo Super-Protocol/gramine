@@ -9,7 +9,7 @@ endif
 .PHONY: all
 all: sqlite3.manifest
 ifeq ($(SGX),1)
-all: sqlite3.manifest.sgx sqlite3.sig sqlite3.token
+all: sqlite3.manifest.sgx sqlite3.sig
 endif
 
 sqlite3.manifest: manifest.template
@@ -30,32 +30,30 @@ sgx_sign: sqlite3.manifest
 		--manifest $< \
 		--output $<.sgx
 
-sqlite3.token: sqlite3.sig
-	gramine-sgx-get-token --output sqlite3.token --sig sqlite3.sig
-
 ifeq ($(SGX),)
 GRAMINE = gramine-direct
 else
 GRAMINE = gramine-sgx
 endif
 
+# Note that command-line arguments are hardcoded in the manifest file.
 .PHONY: regression
 regression: all
-	@rm -f scripts/testdir/*
+	@$(RM) db/*
 
-	$(GRAMINE) sqlite3 scripts/testdir/test.db < scripts/create.sql
+	$(GRAMINE) sqlite3 < scripts/create.sql
 	@echo "[ Success 1/3 ]"
 
-	$(GRAMINE) sqlite3 scripts/testdir/test.db < scripts/update.sql
+	$(GRAMINE) sqlite3 < scripts/update.sql
 	@echo "[ Success 2/3 ]"
 
-	$(GRAMINE) sqlite3 scripts/testdir/test.db < scripts/select.sql > OUTPUT
+	$(GRAMINE) sqlite3 < scripts/select.sql > OUTPUT
 	diff OUTPUT scripts/select.txt
 	@echo "[ Success 3/3 ]"
 
 .PHONY: clean
 clean:
-	$(RM) *.manifest *.manifest.sgx *.token *.sig OUTPUT scripts/testdir/*
+	$(RM) *.manifest *.manifest.sgx *.token *.sig OUTPUT db/*
 
 .PHONY: distclean
 distclean: clean

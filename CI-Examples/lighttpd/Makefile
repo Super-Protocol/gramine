@@ -25,7 +25,7 @@ CONF_FILES = lighttpd-server.conf lighttpd.conf
 .PHONY: all
 all: $(INSTALL_DIR)/sbin/lighttpd lighttpd.manifest $(CONF_FILES) testdata
 ifeq ($(SGX),1)
-all: lighttpd.manifest.sgx lighttpd.sig lighttpd.token
+all: lighttpd.manifest.sgx lighttpd.sig
 endif
 
 $(INSTALL_DIR)/sbin/lighttpd: $(LIGHTTPD_SRC)/configure
@@ -48,8 +48,7 @@ lighttpd.manifest: lighttpd.manifest.template
 	gramine-manifest \
 		-Dlog_level=$(GRAMINE_LOG_LEVEL) \
 		-Darch_libdir=$(ARCH_LIBDIR) \
-		-Dinstall_dir=$(INSTALL_DIR) \
-		-Dinstall_dir_abspath=$(abspath $(INSTALL_DIR)) \
+		-Dinstall_dir=$(abspath $(INSTALL_DIR)) \
 		$< >$@
 
 # Make on Ubuntu <= 20.04 doesn't support "Rules with Grouped Targets" (`&:`),
@@ -62,9 +61,6 @@ sgx_sign: lighttpd.manifest $(INSTALL_DIR)/sbin/lighttpd
 	gramine-sgx-sign \
 		--manifest $< \
 		--output $<.sgx
-
-lighttpd.token: lighttpd.sig
-	gramine-sgx-get-token --output $@ --sig $^
 
 # lighttpd configuration and test data
 lighttpd-server.conf:
@@ -107,9 +103,10 @@ else
 GRAMINE = gramine-sgx
 endif
 
+# Note that command-line arguments are hardcoded in the manifest file.
 .PHONY: start-gramine-server
 start-gramine-server: all
-	$(GRAMINE) ./lighttpd -D -m $(INSTALL_DIR)/lib -f lighttpd.conf
+	$(GRAMINE) ./lighttpd
 
 .PHONY: clean
 clean:

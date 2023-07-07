@@ -75,23 +75,17 @@ with Gramine for their confidential computing solutions.
 Getting help
 ============
 
-For any questions, please send an email to users@gramineproject.io
-(`public archive <https://groups.google.com/g/gramine-users>`__) or join us on
-our `Gitter chat <https://gitter.im/gramineproject/community>`__.
+For any questions, please use `GitHub Discussions
+<https://github.com/gramineproject/gramine/discussions>`__ or join us on our
+`Gitter chat <https://gitter.im/gramineproject/community>`__.
 
-For bug reports, post an issue on our GitHub repository:
-https://github.com/gramineproject/gramine/issues.
+For bug reports and feature requests, `post an issue on our GitHub repository
+<https://github.com/gramineproject/gramine/issues>`__.
 
+If you prefer emails, please send them to users@gramineproject.io
+(`public archive <https://groups.google.com/g/gramine-users>`__).
 
 Reporting security issues
 =========================
 
 Please report security issues to security@gramineproject.io.
-
-
-Acknowledgments
-===============
-
-Gramine Project benefits from generous help of `fosshost.org
-<https://fosshost.org>`__: they lend us a VPS, which we use as toolserver and
-package hosting.

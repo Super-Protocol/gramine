@@ -34,7 +34,7 @@ endif
 .PHONY: all
 all: redis-server redis-server.manifest
 ifeq ($(SGX),1)
-all: redis-server.manifest.sgx redis-server.sig redis-server.token
+all: redis-server.manifest.sgx redis-server.sig
 endif
 
 ############################## REDIS EXECUTABLE ###############################
@@ -63,10 +63,10 @@ endif
 
 ################################ REDIS MANIFEST ###############################
 
-# The template file contains almost all necessary information to run Redis under
-# Gramine / Gramine-SGX. We create redis-server.manifest (to be run under
-# non-SGX Gramine) by replacing variables in the template file using the
-# "gramine-manifest" script.
+# The template file is a Jinja2 template and contains almost all necessary
+# information to run Redis under Gramine / Gramine-SGX. We create
+# redis-server.manifest (to be run under non-SGX Gramine) by replacing variables
+# in the template file using the "gramine-manifest" script.
 
 redis-server.manifest: redis-server.manifest.template
 	gramine-manifest \
@@ -78,13 +78,6 @@ redis-server.manifest: redis-server.manifest.template
 # procedure measures all Redis trusted files, adds the measurement to the
 # resulting manifest.sgx file (among other, less important SGX options) and
 # creates redis-server.sig (SIGSTRUCT object).
-#
-# Gramine-SGX requires EINITTOKEN and SIGSTRUCT objects (see SGX hardware ABI,
-# in particular EINIT instruction). The "gramine-sgx-get-token" script
-# generates EINITTOKEN based on a SIGSTRUCT and puts it in .token file. Note
-# that filenames must be the same as the manifest name (i.e., "redis-server").
-# EINITTOKEN must be generated on the machine where the application will run,
-# not where it was built.
 
 # Make on Ubuntu <= 20.04 doesn't support "Rules with Grouped Targets" (`&:`),
 # see the helloworld example for details on this workaround.
@@ -97,9 +90,6 @@ sgx_outputs: redis-server.manifest $(SRCDIR)/src/redis-server
 		--manifest redis-server.manifest \
 		--output redis-server.manifest.sgx
 
-redis-server.token: redis-server.sig
-	gramine-sgx-get-token --output $@ --sig $<
-
 ########################### COPIES OF EXECUTABLES #############################
 
 # Redis build process creates the final executable as src/redis-server. For
@@ -109,6 +99,7 @@ redis-server: $(SRCDIR)/src/redis-server
 	cp $< $@
 
 ############################## RUNNING TESTS ##################################
+
 .PHONY: start-native-server
 start-native-server: all
 	./redis-server --save '' --protected-mode no
@@ -119,9 +110,10 @@ else
 GRAMINE = gramine-sgx
 endif
 
+# Note that command-line arguments are hardcoded in the manifest file.
 .PHONY: start-gramine-server
 start-gramine-server: all
-	$(GRAMINE) redis-server --save '' --protected-mode no
+	$(GRAMINE) redis-server
 
 ################################## CLEANUP ####################################
 

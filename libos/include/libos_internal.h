@@ -27,12 +27,8 @@ extern struct pal_public_state* g_pal_public_state;
 
 // TODO(mkow): We should make it cross-object-inlinable, ideally by enabling LTO, less ideally by
 // pasting it here and making `inline`, but our current linker scripts prevent both.
-void libos_log(int level, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
-
-#define DEBUG_HERE()                                             \
-    do {                                                         \
-        log_debug("%s (" __FILE__ ":%d)", __func__, __LINE__);   \
-    } while (0)
+void libos_log(int level, const char* file, const char* func, uint64_t line,
+               const char* fmt, ...) __attribute__((format(printf, 5, 6)));
 
 /*!
  * \brief High-level syscall emulation entrypoint.
@@ -196,6 +192,7 @@ int init_rlimit(void);
 bool is_user_memory_readable(const void* addr, size_t size);
 bool is_user_memory_writable(const void* addr, size_t size);
 bool is_user_string_readable(const char* addr);
+bool is_user_memory_writable_no_skip(const void* addr, size_t size);
 
 uint64_t get_rlimit_cur(int resource);
 void set_rlimit_cur(int resource, uint64_t rlim);
@@ -251,7 +248,6 @@ void delete_epoll_items_for_fd(int fd, struct libos_handle* handle);
  */
 void maybe_epoll_et_trigger(struct libos_handle* handle, int ret, bool in, bool was_partial);
 
-void* allocate_stack(size_t size, size_t protect_size, bool user);
 int init_stack(const char* const* argv, const char* const* envp, char*** out_argp,
                elf_auxv_t** out_auxv);
 

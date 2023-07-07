@@ -20,6 +20,7 @@ tests = {
     'exec': {},
     'exec_fork': {},
     'exec_invalid_args': {},
+    'exec_null': {},
     'exec_same': {},
     'exec_script': {},
     'exec_victim': {},
@@ -64,6 +65,7 @@ tests = {
     'mprotect_file_fork': {},
     'mprotect_prot_growsdown': {},
     'multi_pthread': {},
+    'munmap': {},
     'open_opath': {},
     'openmp': {
         # NOTE: This will use `libgomp` in GCC and `libomp` in Clang.
@@ -132,6 +134,9 @@ tests = {
 
 if host_machine.cpu_family() == 'x86_64'
     tests += {
+        'avx': {
+            'c_args': '-mavx',
+        },
         'cpuid': {},
         'debug_regs_x86_64': {
             'c_args': '-g3',

@@ -1,7 +1,6 @@
 #!/bin/sh
 
-set -x
-set -e
+set -ex
 
 CURRENT_SOURCE_DIR="$1"
 VENDOR_SOURCE_DIR="$2"
@@ -26,6 +25,7 @@ cp -ar "$VENDOR_SOURCE_DIR" "$PRIVATE_DIR"
 cp "$CURRENT_SOURCE_DIR"/include/mbedtls/*.h "$PRIVATE_DIR"/include/mbedtls/
 patch -p1 --directory "$PRIVATE_DIR" <"$CURRENT_SOURCE_DIR"/gramine.patch
 patch -p1 --directory "$PRIVATE_DIR" <"$CURRENT_SOURCE_DIR"/fcntl.patch
+patch -p1 --directory "$PRIVATE_DIR" <"$CURRENT_SOURCE_DIR"/enforce-aes-ni.patch
 
 make -C "$PRIVATE_DIR" lib "$@"
 

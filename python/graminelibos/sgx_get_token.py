@@ -6,7 +6,6 @@ import hashlib
 import socket
 import struct
 
-from . import aesm_pb2 # pylint: disable=import-error,no-name-in-module
 from . import _offsets as offs # pylint: disable=import-error,no-name-in-module
 
 def get_optional_sgx_features(sig):
@@ -41,15 +40,17 @@ def get_optional_sgx_features(sig):
 
     return new_xfrms
 
-def is_dcap():
-    '''Check if we're dealing with DCAP driver.'''
-    return hasattr(offs, 'SGX_DCAP')
+def is_oot():
+    '''Check if we're dealing with OOT driver.'''
+    return hasattr(offs, 'CONFIG_SGX_DRIVER_OOT')
 
 def p64(x):
     return x.to_bytes(8, byteorder='little')
 
 def connect_aesmd(mrenclave, modulus, flags, xfrms):
     '''Connect with AESMD.'''
+
+    from . import aesm_pb2 # pylint: disable=import-error,no-name-in-module
 
     req_msg = aesm_pb2.GetTokenReq()
     req_msg.req.signature = mrenclave
@@ -89,20 +90,6 @@ def connect_aesmd(mrenclave, modulus, flags, xfrms):
 
     return ret_msg.ret.token
 
-def create_dummy_token(flags, xfrms, misc_select):
-    '''
-    Create dummy token with a few fields initialized with real values and others
-    with a placeholder ('\\0')
-    '''
-    token = bytearray(304)
-
-    # fields read by create_enclave() in sgx_framework.c
-    struct.pack_into('<Q', token, 48, flags)
-    struct.pack_into('<Q', token, 56, xfrms)
-    struct.pack_into('<L', token, 236, misc_select)
-
-    return token
-
 def get_token(sig, verbose=False):
     """Get SGX token (aka EINITTOKEN).
 
@@ -120,6 +107,9 @@ def get_token(sig, verbose=False):
     Returns:
         bytes: SGX token.
     """
+    if not is_oot():
+        raise RuntimeError('The upstream driver doesn\'t use EINITTOKEN')
+
     xfrms = get_optional_sgx_features(sig)
 
     # calculate MRSIGNER as sha256 hash over RSA public key's modulus
@@ -145,9 +135,4 @@ def get_token(sig, verbose=False):
         print(f'    date:        {sig["date_year"]:04d}-{sig["date_month"]:02d}-'
               f'{sig["date_day"]:02d}')
 
-    if is_dcap():
-        token = create_dummy_token(sig['attribute_flags'], xfrms, sig['misc_select'])
-    else:
-        token = connect_aesmd(sig['enclave_hash'], sig['modulus'], sig['attribute_flags'], xfrms)
-
-    return token
+    return connect_aesmd(sig['enclave_hash'], sig['modulus'], sig['attribute_flags'], xfrms)

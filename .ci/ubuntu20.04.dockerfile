@@ -1,6 +1,5 @@
 FROM ubuntu:20.04
 
-# Add steps here to set up dependencies
 RUN apt-get update && env DEBIAN_FRONTEND=noninteractive apt-get install -y \
     autoconf \
     bc \
@@ -18,7 +17,6 @@ RUN apt-get update && env DEBIAN_FRONTEND=noninteractive apt-get install -y \
     libapr1-dev \
     libaprutil1-dev \
     libcjson-dev \
-    libcurl4-openssl-dev \
     libelf-dev \
     libevent-dev \
     libexpat1 \
@@ -64,7 +62,6 @@ RUN apt-get update && env DEBIAN_FRONTEND=noninteractive apt-get install -y \
     python3-pytest-xdist \
     python3-scipy \
     python3-sphinx-rtd-theme \
-    python3-toml \
     shellcheck \
     sphinx-doc \
     sqlite3 \
@@ -73,6 +70,18 @@ RUN apt-get update && env DEBIAN_FRONTEND=noninteractive apt-get install -y \
     wget \
     zlib1g \
     zlib1g-dev
+
+# Needed by DCAP attestation e.g. in "CI-Examples/ra-tls-mbedtls"
+RUN curl -fsSL https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key | apt-key add -
+RUN echo 'deb [arch=amd64] https://download.01.org/intel-sgx/sgx_repo/ubuntu focal main' > /etc/apt/sources.list.d/intel-sgx.list
+RUN apt-get update && env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    libsgx-dcap-default-qpl \
+    libsgx-dcap-quote-verify-dev \
+    libsgx-urts
+
+# set up PCCS connection configuration
+RUN sed -i -e 's/localhost/host.docker.internal/g' /etc/sgx_default_qcnl.conf \
+    && sed -i -e 's/"use_secure_cert": true/"use_secure_cert": false/' /etc/sgx_default_qcnl.conf
 
 # Install wrk2 benchmark. This benchmark is used in `benchmark-http.sh`.
 RUN git clone https://github.com/giltene/wrk2.git \
@@ -87,32 +96,9 @@ RUN git clone https://github.com/giltene/wrk2.git \
 # the earliest supported minor version (pip implicitly installs latest version satisfying the
 # specification)
 RUN python3 -m pip install -U \
+    'tomli>=1.1.0' \
+    'tomli-w>=0.4.0' \
     'meson>=0.56,<0.57' \
     'docutils>=0.17,<0.18'
 
-# Add the user UID:1001, GID:1001, home at /leeroy
-RUN \
-    groupadd -r leeroy -g 1001 && \
-    useradd -u 1001 -r -g leeroy -m -d /leeroy -c "Leeroy Jenkins" leeroy && \
-    chmod 755 /leeroy
-
-# Make sure /leeroy can be written by leeroy
-RUN chown 1001 /leeroy
-
-# Blow away any random state
-RUN rm -f /leeroy/.rnd
-
-# Make a directory for the intel driver
-RUN mkdir -p /opt/intel && chown 1001 /opt/intel
-
-# Set the working directory to leeroy home directory
-WORKDIR /leeroy
-
-# Specify the user to execute all commands below
-USER leeroy
-
-# Set environment variables.
-ENV HOME /leeroy
-
-# Define default command.
 CMD ["bash"]

@@ -3,8 +3,8 @@ THIS_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
 ARCH_LIBDIR ?= /lib/$(shell $(CC) -dumpmachine)
 
 INSTALL_DIR ?= $(THIS_DIR)install
-NGINX_SRC ?= $(THIS_DIR)nginx-1.16.1
-NGINX_SHA256 ?= f11c2a6dd1d3515736f0324857957db2de98be862461b5a542a3ac6188dbe32b
+NGINX_SRC ?= $(THIS_DIR)nginx-1.22.0
+NGINX_SHA256 ?= b33d569a6f11a01433a57ce17e83935e953ad4dc77cdd4d40f896c88ac26eb53
 
 NGINX_MIRRORS ?= \
     http://nginx.org/download \
@@ -23,7 +23,7 @@ endif
 .PHONY: all
 all: $(INSTALL_DIR)/sbin/nginx nginx.manifest config testdata ssldata nginx_args
 ifeq ($(SGX),1)
-all: nginx.manifest.sgx nginx.sig nginx.token
+all: nginx.manifest.sgx nginx.sig
 endif
 
 # Note that Gramine doesn't support eventfd() and PR_SET_DUMPABLE, so we manually
@@ -66,9 +66,6 @@ sgx_sign: nginx.manifest $(INSTALL_DIR)/sbin/nginx \
 	gramine-sgx-sign \
 		--manifest $< \
 		--output $<.sgx
-
-nginx.token: nginx.sig
-	gramine-sgx-get-token --output $@ --sig $<
 
 # Nginx configuration and test data
 .PHONY: config

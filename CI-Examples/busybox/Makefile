@@ -20,7 +20,7 @@ RA_CLIENT_LINKABLE ?= 0
 .PHONY: all
 all: busybox busybox.manifest
 ifeq ($(SGX),1)
-all: busybox.manifest.sgx busybox.sig busybox.token
+all: busybox.manifest.sgx busybox.sig
 endif
 
 $(SRCDIR)/Makefile:
@@ -34,10 +34,6 @@ $(SRCDIR)/.config: $(SRCDIR)/Makefile
 	$(MAKE) -C $(SRCDIR) defconfig
 	# Enable usage of Busybox's built-in applets
 	sed -e 's/.*CONFIG_FEATURE_SH_STANDALONE.*/CONFIG_FEATURE_SH_STANDALONE=y/' \
-		-i $(SRCDIR)/.config
-	# Currently '/proc/self/exe' is bugged in gramine, so manually set path
-	# to the Busybox binary
-	sed -e 's/.*CONFIG_BUSYBOX_EXEC_PATH.*/CONFIG_BUSYBOX_EXEC_PATH="\/busybox"/' \
 		-i $(SRCDIR)/.config
 
 $(SRCDIR)/busybox: $(SRCDIR)/.config
@@ -62,10 +58,6 @@ sgx_sign: busybox.manifest busybox
 	gramine-sgx-sign \
 		--manifest $< \
 		--output $<.sgx
-
-busybox.token: busybox.sig
-	gramine-sgx-get-token \
-		--output $@ --sig $<
 
 # Copy Busybox binary to our root directory for simplicity.
 busybox: $(SRCDIR)/busybox

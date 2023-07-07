@@ -8,8 +8,6 @@ MEMCACHED_MIRRORS ?= \
 
 MEMCACHED_SHA256 ?= e3d10c06db755b220f43d26d3b68d15ebf737a69c7663529b504ab047efe92f4
 
-UBUNTU_VER = $(shell lsb_release --short --id)$(shell lsb_release --short --release)
-
 ifeq ($(DEBUG),1)
 GRAMINE_LOG_LEVEL = debug
 else
@@ -19,7 +17,7 @@ endif
 .PHONY: all
 all: memcached memcached.manifest
 ifeq ($(SGX),1)
-all: memcached.manifest.sgx memcached.sig memcached.token
+all: memcached.manifest.sgx memcached.sig
 endif
 
 $(SRCDIR)/configure:
@@ -49,10 +47,6 @@ sgx_sign: memcached.manifest memcached
 		--manifest $< \
 		--output $<.sgx
 
-memcached.token: memcached.sig
-	gramine-sgx-get-token \
-		--output memcached.token --sig memcached.sig
-
 # for simplicity, copy memcached executable into our root directory
 memcached: $(SRCDIR)/memcached
 	cp $< $@
@@ -69,7 +63,7 @@ endif
 
 .PHONY: start-gramine-server
 start-gramine-server: all
-	$(GRAMINE) memcached -u nobody
+	$(GRAMINE) memcached
 
 .PHONY: clean
 clean:

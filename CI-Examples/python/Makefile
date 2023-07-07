@@ -9,7 +9,7 @@ endif
 .PHONY: all
 all: python.manifest
 ifeq ($(SGX),1)
-all: python.manifest.sgx python.sig python.token
+all: python.manifest.sgx python.sig
 endif
 
 RA_TYPE ?= none
@@ -37,9 +37,6 @@ sgx_sign: python.manifest
 		--manifest $< \
 		--output $<.sgx
 
-python.token: python.sig
-	gramine-sgx-get-token --output $@ --sig $<
-
 .PHONY: check
 check: all
 	./run-tests.sh > TEST_STDOUT 2> TEST_STDERR
@@ -48,6 +45,7 @@ check: all
 	@grep -q "Success 3/4" TEST_STDOUT
 	@grep -q "Success 4/4" TEST_STDOUT
 ifeq ($(SGX),1)
+	@grep -q "Success SGX report" TEST_STDOUT
 	@grep -q "Success SGX quote" TEST_STDOUT
 endif
 
