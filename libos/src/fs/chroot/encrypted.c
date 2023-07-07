@@ -34,6 +34,7 @@
 #include <limits.h>
 
 #include "libos_fs.h"
+#include "libos_flags_conv.h"
 #include "libos_fs_encrypted.h"
 #include "libos_vma.h"
 #include "perm.h"
@@ -150,7 +151,7 @@ static int chroot_encrypted_lookup(struct libos_dentry* dent) {
         file_off_t size;
 
         struct libos_encrypted_files_key* key = dent->mount->data;
-        ret = encrypted_file_open(uri, key, &enc);
+        ret = encrypted_file_open(uri, key, &enc, PAL_ACCESS_RDONLY);
         if (ret < 0) {
             goto out;
         }
@@ -179,7 +180,6 @@ out:
 static int chroot_encrypted_open(struct libos_handle* hdl, struct libos_dentry* dent, int flags) {
     assert(locked(&g_dcache_lock));
     assert(dent->inode);
-    __UNUSED(flags);
 
     int ret;
 
@@ -187,7 +187,8 @@ static int chroot_encrypted_open(struct libos_handle* hdl, struct libos_dentry* 
         struct libos_encrypted_file* enc = dent->inode->data;
 
         lock(&dent->inode->lock);
-        ret = encrypted_file_get(enc);
+        enum pal_access access = LINUX_OPEN_FLAGS_TO_PAL_ACCESS(flags);
+        ret = encrypted_file_get(enc, access);
         unlock(&dent->inode->lock);
         if (ret < 0)
             return ret;
@@ -204,7 +205,6 @@ static int chroot_encrypted_creat(struct libos_handle* hdl, struct libos_dentry*
                                   mode_t perm) {
     assert(locked(&g_dcache_lock));
     assert(!dent->inode);
-    __UNUSED(flags);
 
     char* uri;
     int ret = chroot_dentry_uri(dent, S_IFREG, &uri);
@@ -219,7 +219,8 @@ static int chroot_encrypted_creat(struct libos_handle* hdl, struct libos_dentry*
 
     struct libos_encrypted_files_key* key = dent->mount->data;
     struct libos_encrypted_file* enc;
-    ret = encrypted_file_create(uri, HOST_PERM(perm), key, &enc);
+    enum pal_access access = LINUX_OPEN_FLAGS_TO_PAL_ACCESS(flags);
+    ret = encrypted_file_create(uri, HOST_PERM(perm), key, &enc, access);
     if (ret < 0)
         goto out;
 
@@ -324,7 +325,7 @@ static int chroot_encrypted_rename(struct libos_dentry* old, struct libos_dentry
 
     struct libos_encrypted_file* enc = old->inode->data;
 
-    ret = encrypted_file_get(enc);
+    ret = encrypted_file_get(enc, PAL_ACCESS_RDONLY);
     if (ret < 0)
         goto out;
 
