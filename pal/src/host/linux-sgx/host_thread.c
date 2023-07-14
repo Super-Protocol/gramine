@@ -147,7 +147,7 @@ int current_enclave_thread_cnt(void) {
  */
 __attribute_no_sanitize_address
 int pal_thread_init(void* tcbptr) {
-    log_always("Thread init: %d\n", current_enclave_thread_cnt());
+    log_always("Thread init: %d", current_enclave_thread_cnt());
     PAL_HOST_TCB* tcb = tcbptr;
     int ret;
 
@@ -205,7 +205,7 @@ out:
 
 __attribute_no_sanitize_address
 noreturn void thread_exit(int status) {
-    log_always("Thread exit: %d\n", current_enclave_thread_cnt());
+    log_always("Thread exit: %d", current_enclave_thread_cnt());
     PAL_HOST_TCB* tcb = pal_get_host_tcb();
 
     /* technically, async signals were already blocked before calling this function
