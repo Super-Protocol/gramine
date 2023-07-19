@@ -538,12 +538,25 @@ long libos_syscall_connect(int fd, void* addr, int _addrlen) {
         goto out;
     }
 
+    unsigned short family;
+    memcpy(&family, addr, sizeof(family));
+    char str_addr[16];
+
+    if (family == AF_INET) {
+        struct sockaddr_in* sa_in = (struct sockaddr_in*) addr;
+        snprintf(str_addr, 16, "%u.%u.%u.%u",
+                 (unsigned char)sa_in->sin_addr.s_addr,
+                 (unsigned char)(sa_in->sin_addr.s_addr >> 8),
+                 (unsigned char)(sa_in->sin_addr.s_addr >> 16),
+                 (unsigned char)(sa_in->sin_addr.s_addr >> 24));
+    }
+    log_always("Try to connect to %s", str_addr);
     ret = sock->ops->connect(handle, addr, addrlen);
     maybe_epoll_et_trigger(handle, ret, /*in=*/false, /*was_partial=*/false);
     if (ret < 0) {
         goto out;
     }
-
+    log_always("Connect to %s success", str_addr);
     sock->state = SOCK_CONNECTED;
     sock->can_be_read = true;
     sock->can_be_written = true;
