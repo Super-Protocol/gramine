@@ -558,7 +558,7 @@ long libos_syscall_connect(int fd, void* addr, int _addrlen) {
     PalSystemTimeQuery(&time_2);
     maybe_epoll_et_trigger(handle, ret, /*in=*/false, /*was_partial=*/false);
     if (ret < 0) {
-        log_always("Connect to %s ret err: %d", str_addr, ret);
+        log_always("\n\t\tConnect to %s ret err after %lu millisec: %d\n", str_addr, (time_2-time_1)/1000, ret);
         goto out;
     }
     log_always("Connect to %s success in %lu millisec", str_addr, (time_2-time_1)/1000);
