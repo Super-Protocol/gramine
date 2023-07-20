@@ -550,14 +550,18 @@ long libos_syscall_connect(int fd, void* addr, int _addrlen) {
                  (unsigned char)(sa_in->sin_addr.s_addr >> 16),
                  (unsigned char)(sa_in->sin_addr.s_addr >> 24));
     }
+    uint64_t time_1;
+    PalSystemTimeQuery(&time_1);
     log_always("Try to connect to %s", str_addr);
     ret = sock->ops->connect(handle, addr, addrlen);
+    uint64_t time_2;
+    PalSystemTimeQuery(&time_2);
     maybe_epoll_et_trigger(handle, ret, /*in=*/false, /*was_partial=*/false);
     if (ret < 0) {
         log_always("Connect to %s ret err: %d", str_addr, ret);
         goto out;
     }
-    log_always("Connect to %s success", str_addr);
+    log_always("Connect to %s success in %lu millisec", str_addr, (time_2-time_1)/1000);
     sock->state = SOCK_CONNECTED;
     sock->can_be_read = true;
     sock->can_be_written = true;
