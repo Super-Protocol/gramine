@@ -554,6 +554,7 @@ long libos_syscall_connect(int fd, void* addr, int _addrlen) {
     ret = sock->ops->connect(handle, addr, addrlen);
     maybe_epoll_et_trigger(handle, ret, /*in=*/false, /*was_partial=*/false);
     if (ret < 0) {
+        log_always("Connect to %s ret err: %d", str_addr, ret);
         goto out;
     }
     log_always("Connect to %s success", str_addr);
