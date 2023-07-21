@@ -459,6 +459,11 @@ long libos_syscall_accept4(int fd, void* addr, int* addrlen, int flags) {
     return do_accept(fd, addr, addrlen, flags);
 }
 
+
+uint16_t myntohs(uint16_t netshort) {
+    return (uint16_t)((netshort & 0xFF) << 8) | ((netshort >> 8) & 0xFF);
+}
+
 long libos_syscall_connect(int fd, void* addr, int _addrlen) {
     int ret;
 
@@ -548,7 +553,7 @@ long libos_syscall_connect(int fd, void* addr, int _addrlen) {
                  (unsigned char)sa_in->sin_addr.s_addr,
                  (unsigned char)(sa_in->sin_addr.s_addr >> 8),
                  (unsigned char)(sa_in->sin_addr.s_addr >> 16),
-                 (unsigned char)(sa_in->sin_addr.s_addr >> 24), sa_in->sin_port);
+                 (unsigned char)(sa_in->sin_addr.s_addr >> 24), myntohs(sa_in->sin_port));
     }
     uint64_t time_1;
     PalSystemTimeQuery(&time_1);
