@@ -540,20 +540,19 @@ long libos_syscall_connect(int fd, void* addr, int _addrlen) {
 
     unsigned short family;
     memcpy(&family, addr, sizeof(family));
-    char str_addr[16];
-    unsigned short port = 0;
+    char str_addr[25];
+    memset(str_addr, 0, 25);
     if (family == AF_INET) {
         struct sockaddr_in* sa_in = (struct sockaddr_in*) addr;
-        port = sa_in->sin_port;
-        snprintf(str_addr, 16, "%u.%u.%u.%u",
+        snprintf(str_addr, 25, "%u.%u.%u.%u:%hu",
                  (unsigned char)sa_in->sin_addr.s_addr,
                  (unsigned char)(sa_in->sin_addr.s_addr >> 8),
                  (unsigned char)(sa_in->sin_addr.s_addr >> 16),
-                 (unsigned char)(sa_in->sin_addr.s_addr >> 24));
+                 (unsigned char)(sa_in->sin_addr.s_addr >> 24), sa_in->sin_port);
     }
     uint64_t time_1;
     PalSystemTimeQuery(&time_1);
-    log_always("Try to connect to %s : %hu", str_addr, port);
+    log_always("Try to connect to %s", str_addr);
     ret = sock->ops->connect(handle, addr, addrlen);
     uint64_t time_2;
     PalSystemTimeQuery(&time_2);
