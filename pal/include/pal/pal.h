@@ -88,6 +88,7 @@ enum {
     PAL_TYPE_PIPE,
     PAL_TYPE_PIPESRV,
     PAL_TYPE_PIPECLI,
+    PAL_TYPE_CONSOLE,
     PAL_TYPE_DEV,
     PAL_TYPE_DIR,
     PAL_TYPE_SOCKET,
@@ -97,8 +98,6 @@ enum {
     PAL_TYPE_EVENTFD,
     PAL_HANDLE_TYPE_BOUND,
 };
-
-#define PAL_IDX_POISON         ((PAL_IDX)-1) /* PAL identifier poison value */
 
 /********** PAL APIs **********/
 
@@ -129,6 +128,7 @@ struct pal_dns_host_conf {
 /* Part of PAL state which is shared between all PALs and accessible (read-only) by the binary
  * started by PAL (usually our LibOS). */
 struct pal_public_state {
+    uint64_t instance_id;
     const char* host_type;
     const char* attestation_type; /* currently only for Linux-SGX */
 
@@ -149,6 +149,8 @@ struct pal_public_state {
     void* memory_address_end;               /*!< usable memory end address */
     uintptr_t early_libos_mem_range_start;  /*!< start of memory usable before checkpoint restore */
     uintptr_t early_libos_mem_range_end;    /*!< end of memory usable before checkpoint restore */
+    void* shared_address_start;             /*!< usable shared memory start address */
+    void* shared_address_end;               /*!< usable shared memory end address */
 
     struct pal_initial_mem_range* initial_mem_ranges; /*!< array of initial memory ranges, see
                                                            `pal_memory.c` for more details */
@@ -329,7 +331,7 @@ typedef uint32_t pal_stream_options_t; /* bitfield */
 /*!
  * \brief Open/create a stream resource specified by `uri`.
  *
- * \param uri          The URI of the stream to be opened/created.
+ * \param typed_uri    The URI of the stream to be opened/created, prefixed with the type.
  * \param access       See #pal_access.
  * \param share_flags  A combination of the `PAL_SHARE_*` flags.
  * \param create       See #pal_create_mode.
@@ -342,12 +344,14 @@ typedef uint32_t pal_stream_options_t; /* bitfield */
  * Supported URI types:
  * * `%file:...`, `dir:...`: Files or directories on the host file system. If #PAL_CREATE_TRY or
  *   #PAL_CREATE_ALWAYS is given in `create` flags, the file/directory will be created.
- * * `dev:...`: Open a device as a stream. For example, `dev:tty` represents the standard I/O.
+ * * `dev:...`: Open a device as a stream.
+ * * `console:`: Open a console (PAL-specific input/output) as a stream. In case of Linux and
+ *   Linux-SGX PALs, the "input/output" are the stdin and stdout streams of the host process.
  * * `pipe.srv:<name>`, `pipe:<name>`, `pipe:`: Open a byte stream that can be used for RPC between
  *   processes. The server side of a pipe can accept any number of connections. If `pipe:` is given
  *   as the URI (i.e., without a name), it will open an anonymous bidirectional pipe.
  */
-int PalStreamOpen(const char* uri, enum pal_access access, pal_share_flags_t share_flags,
+int PalStreamOpen(const char* typed_uri, enum pal_access access, pal_share_flags_t share_flags,
                   enum pal_create_mode create, pal_stream_options_t options, PAL_HANDLE* handle);
 
 /*!
@@ -415,19 +419,11 @@ int PalStreamDelete(PAL_HANDLE handle, enum pal_delete_mode delete_mode);
  * \param size    Size of the requested mapping. Must be non-zero and properly aligned.
  *
  * \returns 0 on success, negative error code on failure.
+ *
+ * Use `PalVirtualMemoryFree` to unmap the file.
  */
 int PalStreamMap(PAL_HANDLE handle, void* addr, pal_prot_flags_t prot, uint64_t offset,
                  size_t size);
-
-/*!
- * \brief Unmap virtual memory that is backed by a file stream.
- *
- * \returns 0 on success, negative error code on failure.
- *
- * `addr` and `size` must be aligned at the allocation alignment.
- * `[addr; addr+size)` must be a continuous memory range without any holes.
- */
-int PalStreamUnmap(void* addr, size_t size);
 
 /*!
  * \brief Set the length of the file referenced by handle to `length`.
@@ -497,7 +493,7 @@ typedef struct _PAL_STREAM_ATTR {
  *
  * This API only applies for URIs such as `%file:...`, `dir:...`, and `dev:...`.
  */
-int PalStreamAttributesQuery(const char* uri, PAL_STREAM_ATTR* attr);
+int PalStreamAttributesQuery(const char* typed_uri, PAL_STREAM_ATTR* attr);
 
 /*!
  * \brief Query the attributes of an open stream.
@@ -517,7 +513,7 @@ int PalStreamAttributesSetByHandle(PAL_HANDLE handle, PAL_STREAM_ATTR* attr);
 /*!
  * \brief This API changes the name of an open stream.
  */
-int PalStreamChangeName(PAL_HANDLE handle, const char* uri);
+int PalStreamChangeName(PAL_HANDLE handle, const char* typed_uri);
 
 struct pal_socket_addr {
     enum pal_socket_domain domain;
@@ -599,13 +595,15 @@ int PalSocketAccept(PAL_HANDLE handle, pal_stream_options_t options, PAL_HANDLE*
  * \param      addr            Address to connect to.
  * \param[out] out_local_addr  On success contains the local address of the socket.
  *                             Can be NULL, to ignore the result.
+ * \param[out] out_inprogress  On success, returns true in special case of an in-progress connection
+ *                             on a non-blocking socket.
  *
  * \returns 0 on success, negative error code on failure.
  *
  * Can also be used to disconnect the socket, if #PAL_DISCONNECT is passed in \p addr.
  */
 int PalSocketConnect(PAL_HANDLE handle, struct pal_socket_addr* addr,
-                     struct pal_socket_addr* out_local_addr);
+                     struct pal_socket_addr* out_local_addr, bool* out_inprogress);
 
 /*!
  * \brief Send data.
@@ -806,9 +804,10 @@ void PalEventClear(PAL_HANDLE handle);
 int PalEventWait(PAL_HANDLE handle, uint64_t* timeout_us);
 
 typedef uint32_t pal_wait_flags_t; /* bitfield */
-#define PAL_WAIT_READ   1
-#define PAL_WAIT_WRITE  2
-#define PAL_WAIT_ERROR  4 /*!< ignored in events */
+#define PAL_WAIT_READ     1
+#define PAL_WAIT_WRITE    2
+#define PAL_WAIT_ERROR    4
+#define PAL_WAIT_HANG_UP  8
 
 /*!
  * \brief Poll - wait for an event to happen on at least one handle.
@@ -829,9 +828,9 @@ int PalStreamsWaitEvents(size_t count, PAL_HANDLE* handle_array, pal_wait_flags_
                          pal_wait_flags_t* ret_events, uint64_t* timeout_us);
 
 /*!
- * \brief Close (deallocate) a PAL handle.
+ * \brief Close and deallocate a PAL handle.
  */
-void PalObjectClose(PAL_HANDLE object_handle);
+void PalObjectDestroy(PAL_HANDLE handle);
 
 /*
  * MISC
@@ -888,6 +887,30 @@ int PalSegmentBaseGet(enum pal_segment_reg reg, uintptr_t* addr);
  * \returns 0 on success, negative error value on failure.
  */
 int PalSegmentBaseSet(enum pal_segment_reg reg, uintptr_t addr);
+
+/*!
+ * \brief Perform a device-specific operation `cmd`.
+ *
+ * \param         handle   Handle of the device.
+ * \param         cmd      Device-dependent request/control code.
+ * \param[in,out] arg      Arbitrary argument to `cmd`. May be unused or used as a 64-bit integer
+ *                         or used as a pointer to a buffer that contains the data required to
+ *                         perform the operation as well as the data returned by the operation. For
+ *                         some PALs (currently Linux and Linux-SGX), the manifest must describe the
+ *                         layout of this buffer in order to correctly copy the data to/from the
+ *                         host.
+ * \param[out]    out_ret  Typically zero, but some device-specific operations return a
+ *                         device-specific value (in addition to or instead of \p arg).
+ *
+ * \returns 0 on success, negative error value on failure.
+ *
+ * Note that this function returns a negative error value only for PAL-internal errors (like errors
+ * during finding/parsing of the corresponding IOCTL data struct in the manifest). The host's error
+ * value, if any, is always passed in `out_ret`.
+ *
+ * This function corresponds to ioctl() in UNIX systems and DeviceIoControl() in Windows.
+ */
+int PalDeviceIoControl(PAL_HANDLE handle, uint32_t cmd, unsigned long arg, int* out_ret);
 
 /*!
  * \brief Obtain the attestation report (local) with `user_report_data` embedded into it.
@@ -949,7 +972,7 @@ int PalAttestationQuote(const void* user_report_data, size_t user_report_data_si
  *                          size.
  *
  * Retrieve the value of a special key. Currently implemented for Linux-SGX PAL, which supports two
- * such keys: `_sgx_mrenclave` and `_sgx_mrsigner`.
+ * such keys: `_sgx_mrenclave` and `_sgx_mrsigner` (see macros below).
  *
  * If a given key is not supported by the current PAL host, the function will return
  * -PAL_ERROR_NOTIMPLEMENTED.
@@ -957,6 +980,9 @@ int PalAttestationQuote(const void* user_report_data, size_t user_report_data_si
 int PalGetSpecialKey(const char* name, void* key, size_t* key_size);
 
 int PalGetTrustedFileHash(const char* path, uint8_t** hash, size_t* hash_size);
+
+#define PAL_KEY_NAME_SGX_MRENCLAVE "_sgx_mrenclave"
+#define PAL_KEY_NAME_SGX_MRSIGNER  "_sgx_mrsigner"
 
 #ifdef __GNUC__
 #define symbol_version_default(real, name, version) \

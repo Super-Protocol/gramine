@@ -19,9 +19,11 @@
 #include "libos_internal.h"
 #include "libos_lock.h"
 #include "libos_process.h"
+#include "libos_rwlock.h"
 #include "libos_signal.h"
 #include "libos_thread.h"
 #include "libos_vma.h"
+#include "linux_abi/errors.h"
 #include "list.h"
 #include "pal.h"
 #include "toml_utils.h"
@@ -148,7 +150,9 @@ static int init_main_thread(void) {
         return -ESRCH;
     }
     g_process.pid = cur_thread->tid;
-    __atomic_store_n(&g_process.pgid, g_process.pid, __ATOMIC_RELEASE);
+    rwlock_write_lock(&g_process_id_lock);
+    g_process.pgid = g_process.pid;
+    rwlock_write_unlock(&g_process_id_lock);
 
     int64_t uid_int64;
     ret = toml_int_in(g_manifest_root, "loader.uid", /*defaultval=*/0, &uid_int64);
@@ -379,7 +383,7 @@ void put_thread(struct libos_thread* thread) {
         free(thread->groups_info.groups);
 
         if (thread->pal_handle && thread->pal_handle != g_pal_public_state->first_thread)
-            PalObjectClose(thread->pal_handle);
+            PalObjectDestroy(thread->pal_handle);
 
         if (thread->handle_map) {
             put_handle_map(thread->handle_map);
@@ -394,7 +398,7 @@ void put_thread(struct libos_thread* thread) {
         /* `signal_altstack` is provided by the user, no need for a clean up. */
 
         if (thread->scheduler_event) {
-            PalObjectClose(thread->scheduler_event);
+            PalObjectDestroy(thread->scheduler_event);
         }
 
         /* `wake_queue` is only meaningful when `thread` is part of some wake up queue (is just

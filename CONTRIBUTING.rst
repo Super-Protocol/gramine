@@ -237,7 +237,7 @@ LTP
 ^^^
 Gramine passes a |nbsp| subset of the LTP tests. New changes should not break
 currently passing LTP tests (and, ideally, might add new passing tests). LTP is
-currently only supported on the Linux PAL.
+currently tested only on the Linux PAL; it may or may not work on Linux-SGX PAL.
 
 To run these tests::
 
@@ -245,47 +245,8 @@ To run these tests::
    # consider -j$(nproc) or similar to parallelize and improve the build time.
    make
    make regression
-   # or
-   make SGX=1 regression
    # or run an individual test by name:
    python3 -m pytest -v -k chmod01
 
 For more information on how to run the ltp tests, please refer to
 :file:`libos/test/ltp/README.rst`.
-
-
-Management Team (Maintainers)
-=============================
-
-The currently active members of the management team are:
-
-* Michał Kowalczyk (Invisible Things Lab/Intel)
-* Dmitrii Kuvaiskii (Intel)
-* Borys Popławski (Invisible Things Lab/Intel)
-* Wojtek Porczyk (Invisible Things Lab/Intel)
-* Don Porter (UNC)
-* Chia-Che Tsai (Texas A&M University)
-* Mona Vij (Intel)
-
-The past (inactive) members of the management team are:
-
-* Paweł Marczewski
-* Rafał Wojdyła
-* Isaku Yamahata
-
-The active members have the review and voting rights. The past (inactive)
-members have only the review rights.
-
-The active members are also the TSC voting members as described in the Technical
-Charter for Gramine project.
-
-The Procedure for Adding and Removing Maintainers
--------------------------------------------------
-
-+ Joining: # of PRs submitted & merged + # of PRs reviewed + # of issues closed
-  >= 20 (this means that a PR which fixes 3 issues counts as 4). Only complete
-  and thorough reviews count.
-+ Leaving: a member may be removed if not active or notoriously breaking rules
-  from this document.
-+ Additionally, at least 60% (rounded up) of currently active members have to
-  agree to make any change to the team membership.

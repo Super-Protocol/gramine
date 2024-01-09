@@ -16,7 +16,10 @@
 #include <stdnoreturn.h>
 
 #include "api.h"
+#include "asan.h"
+#include "assert.h"
 #include "enclave_tf.h"
+#include "gdb_integration/sgx_gdb.h"
 #include "init.h"
 #include "pal.h"
 #include "pal_internal.h"
@@ -201,14 +204,29 @@ static int sanitize_topo_info(struct pal_topo_info* topo_info) {
     }
 
     for (size_t i = 0; i < topo_info->numa_nodes_cnt; i++) {
-        /* Note: Linux doesn't guarantee that distance i -> i is 0, so we aren't checking this (it's
-         * actually non-zero on all machines we have). */
+        /* Note: distance i -> i is 10 according to the ACPI 2.0 SLIT spec, but to accomodate for
+         * weird BIOS settings we aren't checking this. */
         for (size_t j = 0; j < topo_info->numa_nodes_cnt; j++) {
+            if ((!topo_info->numa_nodes[i].is_online || !topo_info->numa_nodes[j].is_online) &&
+                    topo_info->numa_distance_matrix[i*topo_info->numa_nodes_cnt + j] != 0)
+                return -PAL_ERROR_INVAL;
             if (   topo_info->numa_distance_matrix[i*topo_info->numa_nodes_cnt + j]
                 != topo_info->numa_distance_matrix[j*topo_info->numa_nodes_cnt + i])
                 return -PAL_ERROR_INVAL;
         }
     }
+
+    /* Verify that online threads belong to online NUMA nodes (at this point, all indices are
+     * verified to be in-bounds and we can safely use them) */
+    for (size_t i = 0; i < topo_info->threads_cnt; i++) {
+        struct pal_cpu_thread_info* thread = &topo_info->threads[i];
+        if (!thread->is_online)
+            continue;
+        size_t node_id = topo_info->cores[thread->core_id].node_id;
+        if (!topo_info->numa_nodes[node_id].is_online)
+            return -PAL_ERROR_INVAL;
+    }
+
     return 0;
 }
 
@@ -382,6 +400,8 @@ static int import_and_init_extra_runtime_domain_names(struct pal_dns_host_conf* 
 extern void* g_enclave_base;
 extern void* g_enclave_top;
 extern bool g_allowed_files_warn;
+extern uint64_t g_tsc_hz;
+extern size_t g_unused_tcs_pages_num;
 
 static int print_warnings_on_insecure_configs(PAL_HANDLE parent_process) {
     int ret;
@@ -391,22 +411,18 @@ static int print_warnings_on_insecure_configs(PAL_HANDLE parent_process) {
         return 0;
     }
 
-    /* TODO: `sgx.insecure__protected_files_key` is deprecated in v1.2, remove two versions
-     * later. */
-
     bool verbose_log_level    = false;
     bool sgx_debug            = false;
     bool use_cmdline_argv     = false;
     bool use_host_env         = false;
     bool disable_aslr         = false;
     bool allow_eventfd        = false;
+    bool experimental_flock   = false;
     bool allow_all_files      = false;
     bool use_allowed_files    = g_allowed_files_warn;
-    bool protected_files_key  = false;
     bool encrypted_files_keys = false;
 
     char* log_level_str = NULL;
-    char* protected_files_key_str = NULL;
 
     ret = toml_string_in(g_pal_public_state.manifest_root, "loader.log_level", &log_level_str);
     if (ret < 0)
@@ -439,15 +455,13 @@ static int print_warnings_on_insecure_configs(PAL_HANDLE parent_process) {
     if (ret < 0)
         goto out;
 
-    if (get_file_check_policy() == FILE_CHECK_POLICY_ALLOW_ALL_BUT_LOG)
-        allow_all_files = true;
-
-    ret = toml_string_in(g_pal_public_state.manifest_root, "sgx.insecure__protected_files_key",
-                         &protected_files_key_str);
+    ret = toml_bool_in(g_pal_public_state.manifest_root, "sys.experimental__enable_flock",
+                       /*defaultval=*/false, &experimental_flock);
     if (ret < 0)
         goto out;
-    if (protected_files_key_str)
-        protected_files_key = true;
+
+    if (get_file_check_policy() == FILE_CHECK_POLICY_ALLOW_ALL_BUT_LOG)
+        allow_all_files = true;
 
     toml_table_t* manifest_fs = toml_table_in(g_pal_public_state.manifest_root, "fs");
     if (manifest_fs) {
@@ -463,7 +477,7 @@ static int print_warnings_on_insecure_configs(PAL_HANDLE parent_process) {
     }
 
     if (!verbose_log_level && !sgx_debug && !use_cmdline_argv && !use_host_env && !disable_aslr &&
-            !allow_eventfd && !allow_all_files && !use_allowed_files && !protected_files_key &&
+            !allow_eventfd && !experimental_flock && !allow_all_files && !use_allowed_files &&
             !encrypted_files_keys) {
         /* there are no insecure configurations, skip printing */
         ret = 0;
@@ -498,6 +512,10 @@ static int print_warnings_on_insecure_configs(PAL_HANDLE parent_process) {
         log_always("  - sys.insecure__allow_eventfd = true         "
                    "(host-based eventfd is enabled)");
 
+    if (experimental_flock)
+        log_always("  - sys.experimental__enable_flock = true      "
+                   "(flock syscall is enabled; still under development and may contain bugs)");
+
     if (allow_all_files)
         log_always("  - sgx.file_check_policy = allow_all_but_log  "
                    "(all files are passed through from untrusted host without verification)");
@@ -505,10 +523,6 @@ static int print_warnings_on_insecure_configs(PAL_HANDLE parent_process) {
     if (use_allowed_files)
         log_always("  - sgx.allowed_files = [ ... ]                "
                    "(some files are passed through from untrusted host without verification)");
-
-    if (protected_files_key)
-        log_always("  - sgx.insecure__protected_files_key = \"...\"  "
-                   "(key hardcoded in manifest)");
 
     if (encrypted_files_keys)
         log_always("  - fs.insecure__keys.* = \"...\"                "
@@ -522,8 +536,24 @@ static int print_warnings_on_insecure_configs(PAL_HANDLE parent_process) {
     ret = 0;
 out:
     free(log_level_str);
-    free(protected_files_key_str);
     return ret;
+}
+
+static void print_warning_on_invariant_tsc(PAL_HANDLE parent_process) {
+    if (!parent_process && !g_tsc_hz) {
+        /* Warn only in the first process. */
+        log_warning("Could not set up Invariant TSC (CPU is too old or you run on a VM that does "
+                    "not expose corresponding CPUID leaves). This degrades performance.");
+    }
+}
+
+static void post_callback(void) {
+    if (print_warnings_on_insecure_configs(g_pal_common_state.parent_process) < 0) {
+        log_error("Cannot parse the manifest (while checking for insecure configurations)");
+        ocall_exit(1, /*is_exitgroup=*/true);
+    }
+
+    print_warning_on_invariant_tsc(g_pal_common_state.parent_process);
 }
 
 __attribute_no_sanitize_address
@@ -548,7 +578,10 @@ noreturn void pal_linux_main(void* uptr_libpal_uri, size_t libpal_uri_len, void*
     /* Relocate PAL */
     ret = setup_pal_binary();
     if (ret < 0) {
-        log_error("Relocation of the PAL binary failed: %s", pal_strerror(ret));
+        /* PAL relocation failed, so we can't use functions which use PAL .rodata (like
+         * pal_strerror or unix_strerror) to report an error because these functions will return
+         * offset instead of actual address, which will cause a segfault. */
+        log_error("Relocation of the PAL binary failed: %d", ret);
         ocall_exit(1, /*is_exitgroup=*/true);
     }
 
@@ -573,6 +606,27 @@ noreturn void pal_linux_main(void* uptr_libpal_uri, size_t libpal_uri_len, void*
      * set below. */
     g_pal_public_state.memory_address_start = g_pal_linuxsgx_state.heap_min;
     g_pal_public_state.memory_address_end = g_pal_linuxsgx_state.heap_max;
+
+    static_assert(SHARED_ADDR_MIN >= DBGINFO_ADDR + sizeof(struct enclave_dbginfo)
+                      || DBGINFO_ADDR >= SHARED_ADDR_MIN + SHARED_MEM_SIZE,
+                  "SHARED_ADDR overlaps with DBGINFO_ADDR");
+#ifdef ASAN
+    static_assert(SHARED_ADDR_MIN >= ASAN_SHADOW_START + ASAN_SHADOW_LENGTH
+                      || ASAN_SHADOW_START >= SHARED_ADDR_MIN + SHARED_MEM_SIZE,
+                  "SHARED_ADDR overlaps with ASAN_SHADOW");
+#endif
+    void* shared_memory_start = (void*)SHARED_ADDR_MIN;
+    ret = ocall_mmap_untrusted(&shared_memory_start, SHARED_MEM_SIZE, PROT_NONE,
+                               MAP_NORESERVE | MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED_NOREPLACE,
+                               /*fd=*/-1, /*offset=*/0);
+    if (ret < 0) {
+        log_error("Cannot allocate shared memory.");
+        ocall_exit(1, /*is_exitgroup=*/true);
+    }
+    assert(shared_memory_start == (void*)SHARED_ADDR_MIN);
+
+    g_pal_public_state.shared_address_start = shared_memory_start;
+    g_pal_public_state.shared_address_end = shared_memory_start + SHARED_MEM_SIZE;
 
     if (parent_stream_fd < 0) {
         /* First process does not have reserved memory ranges. */
@@ -696,6 +750,20 @@ noreturn void pal_linux_main(void* uptr_libpal_uri, size_t libpal_uri_len, void*
         ocall_exit(1, /*is_exitgroup=*/true);
     }
 
+    int64_t thread_num_int64;
+    ret = toml_int_in(g_pal_public_state.manifest_root, "sgx.max_threads",
+            /*defaultval=*/-1, &thread_num_int64);
+    if (ret < 0) {
+        log_error("Cannot parse 'sgx.max_threads'");
+        ocall_exit(1, /*is_exitgroup=*/true);
+    }
+    if (thread_num_int64 <= 0) {
+        log_error("Invalid 'sgx.max_threads' value");
+        ocall_exit(1, /*is_exitgroup=*/true);
+    }
+    /* `- 1` is because we have the main thread that already uses one TCS */
+    g_unused_tcs_pages_num = thread_num_int64 - 1;
+
     int64_t rpc_thread_num;
     ret = toml_int_in(g_pal_public_state.manifest_root, "sgx.insecure__rpc_thread_num",
                       /*defaultval=*/0, &rpc_thread_num);
@@ -783,12 +851,6 @@ noreturn void pal_linux_main(void* uptr_libpal_uri, size_t libpal_uri_len, void*
     }
     g_pal_public_state.attestation_type = attestation_type_to_str(attestation_type);
 
-    /* this should be placed *after all* initialize-from-manifest routines */
-    if ((ret = print_warnings_on_insecure_configs(parent)) < 0) {
-        log_error("Cannot parse the manifest (while checking for insecure configurations)");
-        ocall_exit(1, /*is_exitgroup=*/true);
-    }
-
     /* set up thread handle */
     PAL_HANDLE first_thread = calloc(1, HANDLE_SIZE(thread));
     if (!first_thread) {
@@ -813,5 +875,5 @@ noreturn void pal_linux_main(void* uptr_libpal_uri, size_t libpal_uri_len, void*
     g_pal_linuxsgx_state.enclave_initialized = true;
 
     /* call main function */
-    pal_main(instance_id, parent, first_thread, arguments, environments);
+    pal_main(instance_id, parent, first_thread, arguments, environments, post_callback);
 }

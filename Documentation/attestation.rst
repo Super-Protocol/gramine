@@ -40,11 +40,13 @@ build their attestation flows. Each next level builds on the previous one and
 exposes a simpler API to the application (but also is more restricted in its
 functionality).
 
-In addition to these three Gramine-native flows, there is also an option to use
-third-party attestation & secret provisioning solutions. This option may be
-better suited for complex deployments, for example, deploying chained
-micro-services in the public cloud. Please refer to :ref:`third_party_solutions`
-for specific examples.
+In addition to these three Gramine-native flows, there are two additional
+options: (1) to use vendor-specific plugins to RA-TLS and Secret Provisioning
+libraries, or (2) to use third-party attestation & secret provisioning
+solutions. These options may be better suited for complex deployments, for
+example, deploying chained micro-services in the public cloud from a specific
+vendor. Please refer to :ref:`vendor_specific_plugins` and
+:ref:`third_party_solutions` sections for specific examples.
 
 
 Remote Attestation flows for EPID and DCAP
@@ -217,15 +219,6 @@ encryption keys (see also :doc:`manifest-syntax`):
   a remote secret provisioning service. The format of the file is a 16-byte raw
   binary value.
 
-.. note::
-   Previously, ``/dev/attestation/protected_files_key`` was used for setting the
-   default encryption key, and Gramine still supports that file for backward
-   compatibility.
-
-   Note that the old file (``/dev/attestation/protected_files_key``) uses a
-   32-character hex value, and the new files
-   (``/dev/attestation/keys/<key_name>``) use a 16-byte raw binary value.
-
 Mid-level RA-TLS interface
 --------------------------
 
@@ -335,17 +328,38 @@ against expected values stored in a central database).
 
 The library also uses the following SGX-specific environment variables:
 
-- ``RA_TLS_ALLOW_OUTDATED_TCB_INSECURE`` (optional) -- whether to allow outdated
-  TCB as returned in the IAS attestation report or returned by the DCAP
-  verification library. Value ``1`` means "allow outdated TCB". Note that
-  allowing outdated TCB is **insecure** and should be used only for debugging
-  and testing. Outdated TCB is not allowed by default.
+- ``RA_TLS_ALLOW_OUTDATED_TCB_INSECURE`` (optional) -- whether to allow
+  "outdated TCB" status as returned in the IAS attestation report or returned by
+  the DCAP verification library. Note that allowing outdated TCB is **insecure**
+  and should be used only for debugging and testing.
+
+- ``RA_TLS_ALLOW_HW_CONFIG_NEEDED`` (optional) -- whether to allow "HW
+  configuration needed" status. Note that this is not marked as insecure, as in
+  some situations a strictly-compliant HW configuration is not required.
+
+- ``RA_TLS_ALLOW_SW_HARDENING_NEEDED`` (optional) -- whether to allow "SW
+  hardening needed" status. Note that this is not marked as insecure, as in some
+  situations a strictly-compliant SW configuration is not required.
 
 - ``RA_TLS_ALLOW_DEBUG_ENCLAVE_INSECURE`` (optional) -- whether to allow debug
-  enclaves (enclaves with ``SECS.ATTRIBUTES.DEBUG`` bit set to one). Value ``1``
-  means "allow debug enclaves". Note that allowing debug enclaves is
-  **insecure** and should be used only for debugging and testing. Debug enclaves
-  are not allowed by default.
+  enclaves (enclaves with ``SECS.ATTRIBUTES.DEBUG`` bit set to one). Note that
+  allowing debug enclaves is **insecure** and should be used only for debugging
+  and testing.
+
+Note that the IAS attestation report/DCAP verification library can return the
+"HW configuration and SW hardening needed" status. To allow this status, you
+must set both ``RA_TLS_ALLOW_HW_CONFIG_NEEDED`` and
+``RA_TLS_ALLOW_SW_HARDENING_NEEDED`` environment variables.
+
+Each of the above environment variables must be set to ``1`` to allow the
+corresponding status. By default, all of the above environment variables are not
+set, and thus all not-OK statuses are disallowed. For more information, please
+refer to the official Intel documentation:
+
+- `Intel EPID/IAS
+  <https://api.trustedservices.intel.com/documents/sgx-attestation-api-spec.pdf>`__
+- `Intel ECDSA/DCAP
+  <https://download.01.org/intel-sgx/latest/dcap-latest/linux/docs/Intel_SGX_ECDSA_QuoteLibReference_DCAP_API.pdf>`__
 
 The library uses the following EPID-specific environment variables if available:
 
@@ -416,6 +430,8 @@ EPID based ``secret_prov_verify_epid.so`` and DCAP/ECDSA based
 The examples of using RA-TLS can be found under ``CI-Examples/ra-tls-secret-prov``.
 The examples include minimalistic provisioning of constant-string secrets as
 well as provisioning of an encryption key and its later use for encrypted files.
+
+.. _secret-prov-attest-so:
 
 ``secret_prov_attest.so``
 ^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -509,6 +525,43 @@ The library uses the same SGX-specific environment variables as
 ``secret_prov_verify_epid.so`` and ignores the EPID-specific environment
 variables. The library expects all the DCAP infrastructure to be installed and
 working correctly on the host.
+
+
+.. _vendor_specific_plugins:
+
+Vendor-specific plugins
+-----------------------
+
+The RA-TLS and Secret Provisioning interfaces described above work only with
+default Intel-provided attestation infrastructures (IAS for the EPID flows and
+Intel PCCS/PCS flows). There are several other attestation infrastructures built
+by vendors other than Intel. For these cases, Gramine provides plugins to RA-TLS
+and Secret Provisioning, which currently can be found in the companion `contrib
+<https://github.com/gramineproject/contrib>`__ repository.
+
+Microsoft Azure Attestation (MAA)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. note ::
+   The MAA plugin is not an official part of the Gramine project yet and wasn't
+   thoroughly reviewed in terms of security.
+
+Microsoft Azure Attestation (MAA) is the attestation protocol (attestation
+scheme) developed by Microsoft and available in the Microsoft Azure public
+cloud. Similarly to the Intel-developed EPID protocol, the remote verifier based
+on the MAA protocol needs to contact the MAA attestation provider each time it
+wishes to attest an enclave. An enclave sends a DCAP-formatted SGX quote to the
+client/verifier who will forward it to the MAA attestation provider to check the
+enclave's validity and receive back the attestation response embedding the JSON
+Web Token (JWT) that contains a set of claims about the SGX enclave.
+
+We provide an MAA plugin for RA-TLS and Secret Provisioning. This plugin
+installs MAA-specific versions of the RA-TLS and SecretProv libraries alongside
+default RA-TLS and SecretProv libraries, and the applications may choose these
+MAA-specific versions if running inside the Microsoft Azure cloud.
+
+For more information, refer to the `MAA plugin README
+<https://github.com/gramineproject/contrib/tree/master/Integrations/azure/ra_tls_maa>`__.
 
 
 .. _third_party_solutions:

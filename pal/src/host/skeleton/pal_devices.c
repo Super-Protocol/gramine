@@ -2,7 +2,7 @@
 /* Copyright (C) 2014 Stony Brook University */
 
 /*
- * Operations to handle devices (currently only "dev:tty" which is stdin/stdout).
+ * Operations to handle devices.
  */
 
 #include "api.h"
@@ -24,7 +24,15 @@ static int64_t dev_write(PAL_HANDLE handle, uint64_t offset, uint64_t size, cons
     return -PAL_ERROR_NOTIMPLEMENTED;
 }
 
-static int dev_close(PAL_HANDLE handle) {
+static void dev_destroy(PAL_HANDLE handle) {
+    /* noop */
+}
+
+static int dev_delete(PAL_HANDLE handle, enum pal_delete_mode delete_mode) {
+    return -PAL_ERROR_NOTIMPLEMENTED;
+}
+
+static int64_t dev_setlength(PAL_HANDLE handle, uint64_t length) {
     return -PAL_ERROR_NOTIMPLEMENTED;
 }
 
@@ -40,8 +48,8 @@ static int dev_attrquerybyhdl(PAL_HANDLE handle, PAL_STREAM_ATTR* attr) {
     return -PAL_ERROR_NOTIMPLEMENTED;
 }
 
-/* this dummy function is implemented to support opening TTY devices with O_TRUNC flag */
-static int64_t dev_setlength(PAL_HANDLE handle, uint64_t length) {
+static int dev_map(PAL_HANDLE handle, void* addr, pal_prot_flags_t prot, uint64_t offset,
+                   uint64_t size) {
     return -PAL_ERROR_NOTIMPLEMENTED;
 }
 
@@ -49,9 +57,15 @@ struct handle_ops g_dev_ops = {
     .open           = &dev_open,
     .read           = &dev_read,
     .write          = &dev_write,
-    .close          = &dev_close,
+    .destroy        = &dev_destroy,
+    .delete         = &dev_delete,
+    .map            = &dev_map,
     .setlength      = &dev_setlength,
     .flush          = &dev_flush,
     .attrquery      = &dev_attrquery,
     .attrquerybyhdl = &dev_attrquerybyhdl,
 };
+
+int _PalDeviceIoControl(PAL_HANDLE handle, uint32_t cmd, unsigned long arg, int* out_ret) {
+    return -PAL_ERROR_NOTIMPLEMENTED;
+}

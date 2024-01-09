@@ -2,9 +2,10 @@ executable('gramine-sgx-ias-request',
     'ias_request.c',
 
     dependencies: [
+        sgx_ias_util_dep,
         sgx_util_dep,
     ],
 
     install: true,
-    install_rpath: join_paths(get_option('prefix'), get_option('libdir')),
+    install_rpath: get_option('prefix') / get_option('libdir'),
 )

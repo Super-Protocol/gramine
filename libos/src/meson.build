@@ -37,6 +37,7 @@ libos_sources = files(
     'fs/proc/info.c',
     'fs/proc/ipc_thread.c',
     'fs/proc/thread.c',
+    'fs/shm/fs.c',
     'fs/socket/fs.c',
     'fs/sys/cache_info.c',
     'fs/sys/cpu_info.c',
@@ -63,6 +64,7 @@ libos_sources = files(
     'libos_parser.c',
     'libos_pollable_event.c',
     'libos_rtld.c',
+    'libos_rwlock.c',
     'libos_syscalls.c',
     'libos_utils.c',
     'net/ip.c',
@@ -111,7 +113,7 @@ libos_sources = files(
 subdir('arch')
 libos_sources += libos_sources_arch
 
-libos_map = join_paths(meson.current_source_dir(), 'libos.map')
+libos_map = meson.current_source_dir() / 'libos.map'
 
 subdir('vdso')
 

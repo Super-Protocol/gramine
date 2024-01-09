@@ -7,7 +7,6 @@
 
 #pragma once
 
-#include <asm/stat.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -16,6 +15,8 @@
 #include "libos_refcount.h"
 #include "libos_types.h"
 #include "libos_utils.h"
+#include "linux_abi/fs.h"
+#include "linux_abi/limits.h"
 #include "list.h"
 #include "pal.h"
 
@@ -184,13 +185,23 @@ struct libos_fs_ops {
     /* checkpoint/migrate the file system */
     ssize_t (*checkpoint)(void** checkpoint, void* mount_data);
     int (*migrate)(void* checkpoint, void** mount_data);
+
+    /*
+     * \brief Change file permissions.
+     *
+     * \param hdl   File handle.
+     * \param perm  New permissions for the file.
+     *
+     * Changes the permissions of a file associated with a given file handle.
+     *
+     * On success, the caller should update `hdl->inode->perm`.
+     */
+    int (*fchmod)(struct libos_handle* hdl, mode_t perm);
 };
 
 /* Limit for the number of dentry children. This is mostly to prevent overflow if (untrusted) host
  * pretends to have many files in a directory. */
 #define DENTRY_MAX_CHILDREN 1000000
-
-struct fs_lock_info;
 
 /*
  * Describes a single path within a mounted filesystem. If `inode` is set, it is the file at given
@@ -226,13 +237,13 @@ struct libos_dentry {
      * `g_dcache_lock`. */
     struct libos_mount* attached_mount;
 
-    /* File lock information, stored only in the main process. Managed by `libos_fs_lock.c`. */
-    struct fs_lock* fs_lock;
+    /* File locks information, stored only in the main process. Managed by `libos_fs_lock.c`. */
+    struct dent_file_locks* file_locks;
 
     /* True if the file might have locks placed by current process. Used in processes other than
      * main process, to prevent unnecessary IPC calls on handle close. Managed by
      * `libos_fs_lock.c`. */
-    bool maybe_has_fs_locks;
+    bool maybe_has_file_locks;
 
     refcount_t ref_count;
 };
@@ -270,6 +281,9 @@ struct libos_inode {
 
     /* Filesystem-specific data */
     void* data;
+
+    /* Number of VMAs the file is mmapped to; should be accessed using atomic operations. */
+    uint64_t num_mmapped;
 
     struct libos_lock lock;
     refcount_t ref_count;
@@ -459,14 +473,6 @@ struct libos_d_ops {
      */
     int (*irestore)(struct libos_inode* inode, void* data);
 };
-
-/*
- * Limits for path and filename length, as defined in Linux. Note that, same as Linux, PATH_MAX only
- * applies to paths processed by syscalls such as getcwd() - there is no limit on paths you can
- * open().
- */
-#define NAME_MAX 255   /* filename length, NOT including null terminator */
-#define PATH_MAX 4096  /* path size, including null terminator */
 
 struct libos_fs {
     /* Null-terminated, used in manifest and for uniquely identifying a filesystem. */
@@ -923,6 +929,7 @@ extern struct libos_fs epoll_builtin_fs;
 extern struct libos_fs eventfd_builtin_fs;
 extern struct libos_fs synthetic_builtin_fs;
 extern struct libos_fs path_builtin_fs;
+extern struct libos_fs shm_builtin_fs;
 
 struct libos_fs* find_fs(const char* name);
 
@@ -952,6 +959,7 @@ int generic_emulated_mmap(struct libos_handle* hdl, void* addr, size_t size, int
                           uint64_t offset);
 int generic_emulated_msync(struct libos_handle* hdl, void* addr, size_t size, int prot, int flags,
                            uint64_t offset);
+int generic_truncate(struct libos_handle* hdl, file_off_t size);
 
 int synthetic_setup_dentry(struct libos_dentry* dent, mode_t type, mode_t perm);
 

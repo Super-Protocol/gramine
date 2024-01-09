@@ -1,7 +1,7 @@
 # Copyright (c) 2021-2022 Wojtek Porczyk <woju@invisiblethingslab.com>
 
 Name: gramine
-Version: 1.4
+Version: 1.6
 Release: 1%{?dist}
 Group: Development Tools
 Summary: A lightweight usermode guest OS designed to run a single Linux application
@@ -12,7 +12,6 @@ BuildArch: x86_64
 Source0: %{name}-%{version}.tar.gz
 
 BuildRequires: bison
-BuildRequires: cjson-devel
 BuildRequires: gcc
 BuildRequires: gcc-c++
 BuildRequires: jq
@@ -25,11 +24,11 @@ BuildRequires: perl
 BuildRequires: protobuf-c-compiler
 BuildRequires: protobuf-c-devel
 BuildRequires: python3-devel
+BuildRequires: python3-recommonmark
 BuildRequires: python3-sphinx
 BuildRequires: python3-sphinx_rtd_theme
 
-Requires: cjson
-Requires: python3-click
+Requires: python3-click >= 6.7
 Requires: python3-cryptography
 Requires: python3-jinja2
 Requires: python3-protobuf
@@ -97,19 +96,29 @@ install -t %{buildroot}/%{_licensedir}/%{name} LICENSE*.txt
 
 %dir %{_libdir}/%{name}/runtime
 %{_libdir}/%{name}/runtime/glibc
-%{_libdir}/%{name}/runtime/musl
 
 %{_libdir}/pkgconfig/mbedtls_%{name}.pc
+%{_libdir}/pkgconfig/ra_tls_%{name}.pc
+%{_libdir}/pkgconfig/secret_prov_%{name}.pc
+
 %{_libdir}/libmbed{crypto,tls,x509}_%{name}.{so*,a}
 
 %{_libdir}/libra_tls*.so*
+%{_libdir}/libra_tls_verify.a
 %{_libdir}/libsecret_prov*.so*
+%{_libdir}/libsecret_prov_verify.a
 %{_libdir}/libsgx_util.a
 
 %dir %{python3_sitearch}/%{name}libos
 %{python3_sitearch}/%{name}libos/*.py
 %{python3_sitearch}/%{name}libos/__pycache__
+%dir %{python3_sitearch}/%{name}libos.dist-info
+%{python3_sitearch}/%{name}libos.dist-info/METADATA
+%{python3_sitearch}/%{name}libos.dist-info/entry_points.txt
+%{python3_sitearch}/_%{name}libos_offsets.py
+%{python3_sitearch}/__pycache__
 
+%{_includedir}/gramine/*.h
 %{_includedir}/gramine/mbedtls/*.h
 %{_includedir}/gramine/psa/*.h
 

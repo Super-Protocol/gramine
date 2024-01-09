@@ -28,8 +28,6 @@
 
 #define DEFAULT_BACKLOG 2048
 
-extern bool g_vtune_profile_enabled;
-
 rpc_queue_t* g_rpc_queue = NULL; /* pointer to untrusted queue */
 
 static long sgx_ocall_exit(void* args) {
@@ -62,7 +60,7 @@ static long sgx_ocall_exit(void* args) {
     block_async_signals(true);
     ecall_thread_reset();
 
-    unmap_tcs();
+    unmap_my_tcs();
 
     if (!current_enclave_thread_cnt()) {
         /* no enclave threads left, kill the whole process */
@@ -242,8 +240,7 @@ static long sgx_ocall_sched_getaffinity(void* args) {
 }
 
 static long sgx_ocall_clone_thread(void* args) {
-    __UNUSED(args);
-    return clone_thread();
+    return clone_thread(args);
 }
 
 static long sgx_ocall_create_process(void* args) {
@@ -506,40 +503,23 @@ static long sgx_ocall_connect_simple(void* args) {
     struct ocall_connect_simple* ocall_connect_args = args;
     int ret = DO_SYSCALL_INTERRUPTIBLE(connect, ocall_connect_args->fd, ocall_connect_args->addr,
                                        (int)ocall_connect_args->addrlen);
-    if (ret < 0) {
-        /* XXX: Non blocking socket. Currently there is no way of notifying LibOS of successful or
-         * failed connection, so we have to block and wait. */
-        if (ret != -EINPROGRESS) {
-            return ret;
-        }
-        struct pollfd pfd = {
-            .fd = ocall_connect_args->fd,
-            .events = POLLOUT,
-        };
-        ret = DO_SYSCALL(poll, &pfd, 1, /*timeout=*/-1);
-        if (ret != 1 || pfd.revents == 0) {
-            return ret < 0 ? ret : -EINVAL;
-        }
-        int val = 0;
-        unsigned int len = sizeof(val);
-        ret = DO_SYSCALL(getsockopt, ocall_connect_args->fd, SOL_SOCKET, SO_ERROR, &val, &len);
-        if (ret < 0 || val < 0) {
-            return ret < 0 ? ret : -EINVAL;
-        }
-        if (val) {
-            return -val;
-        }
-        /* Connect succeeded. */
-    }
-
-    int addrlen = sizeof(*ocall_connect_args->addr);
-    ret = DO_SYSCALL(getsockname, ocall_connect_args->fd, ocall_connect_args->addr, &addrlen);
-    if (ret < 0) {
+    if (ret < 0 && ret != -EINPROGRESS) {
         return ret;
     }
 
+    /* Connect succeeded or in progress (EINPROGRESS); in both cases retrieve local name -- host
+     * Linux binds the socket to address even in case of EINPROGRESS. */
+    int addrlen = sizeof(*ocall_connect_args->addr);
+    int getsockname_ret = DO_SYSCALL(getsockname, ocall_connect_args->fd, ocall_connect_args->addr,
+                                     &addrlen);
+    if (getsockname_ret < 0) {
+        /* This should never happen, but we have to handle it somehow. */
+        return getsockname_ret;
+    }
     ocall_connect_args->addrlen = addrlen;
-    return 0;
+
+    assert(ret == 0 || ret == -EINPROGRESS);
+    return ret;
 }
 
 static long sgx_ocall_recv(void* args) {
@@ -729,6 +709,11 @@ static long sgx_ocall_debug_describe_location(void* args) {
 #endif
 }
 
+static long sgx_ocall_ioctl(void* args) {
+    struct ocall_ioctl* ocall_ioctl_args = args;
+    return DO_SYSCALL(ioctl, ocall_ioctl_args->fd, ocall_ioctl_args->cmd, ocall_ioctl_args->arg);
+}
+
 static long sgx_ocall_get_quote(void* args) {
     struct ocall_get_quote* ocall_quote_args = args;
     return retrieve_quote(ocall_quote_args->is_epid ? &ocall_quote_args->spid : NULL,
@@ -797,6 +782,7 @@ sgx_ocall_fn_t ocall_table[OCALL_NR] = {
     [OCALL_DEBUG_MAP_REMOVE]         = sgx_ocall_debug_map_remove,
     [OCALL_DEBUG_DESCRIBE_LOCATION]  = sgx_ocall_debug_describe_location,
     [OCALL_EVENTFD]                  = sgx_ocall_eventfd,
+    [OCALL_IOCTL]                    = sgx_ocall_ioctl,
     [OCALL_GET_QUOTE]                = sgx_ocall_get_quote,
     [OCALL_EDMM_MODIFY_PAGES_TYPE]   = sgx_ocall_edmm_modify_pages_type,
     [OCALL_EDMM_REMOVE_PAGES]        = sgx_ocall_edmm_remove_pages,

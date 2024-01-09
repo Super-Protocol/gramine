@@ -17,9 +17,7 @@
  * than glibc.
  */
 
-#include <asm/mman.h>
 #include <endian.h>
-#include <errno.h>
 
 #include "asan.h"
 #include "elf.h"
@@ -34,6 +32,8 @@
 #include "libos_vdso.h"
 #include "libos_vdso_arch.h"
 #include "libos_vma.h"
+#include "linux_abi/errors.h"
+#include "linux_abi/memory.h"
 
 #define INTERP_PATH_SIZE 256 /* Default shebang size */
 
@@ -799,6 +799,7 @@ int load_and_check_exec(const char* path, const char* const* argv, struct libos_
         free(*curr_argv);
         free(curr_argv);
         put_handle(file);
+        file = NULL;
 
         curr_argv = new_argv;
     }
@@ -849,10 +850,7 @@ int load_elf_object(struct libos_handle* file, struct link_map** out_map) {
 
     struct link_map* map = map_elf_object(file, &ehdr);
     if (!map) {
-        log_error("Failed to map %s. This may be caused by the binary being non-PIE, in which "
-                  "case Gramine requires a specially-crafted memory layout. You can enable it "
-                  "by adding 'sgx.nonpie_binary = true' to the manifest.",
-                  fname);
+        log_error("Failed to map %s.", fname);
         return -EINVAL;
     }
 
@@ -888,7 +886,7 @@ static int find_interp(const char* interp_name, struct libos_dentry** out_dent) 
     }
 
     const char* default_paths[] = {"/lib", "/lib64", NULL};
-    const char** paths          = g_library_paths ?: default_paths;
+    const char** paths = g_library_paths ?: default_paths;
 
     for (const char** path = paths; *path; path++) {
         size_t path_len = strlen(*path);
@@ -901,6 +899,7 @@ static int find_interp(const char* interp_name, struct libos_dentry** out_dent) 
         log_debug("searching for interpreter: %s", interp_path);
         struct libos_dentry* dent;
         int ret = path_lookupat(/*start=*/NULL, interp_path, LOOKUP_FOLLOW, &dent);
+        free(interp_path);
         if (ret == 0) {
             *out_dent = dent;
             return 0;
@@ -1114,7 +1113,7 @@ noreturn void execute_elf_object(struct link_map* exec_map, void* argp, elf_auxv
      */
     assert(IS_ALIGNED_PTR(argp, 16)); /* stack must be 16B-aligned */
 
-    static_assert(REQUIRED_ELF_AUXV >= 9, "not enough space on stack for auxv");
+    static_assert(REQUIRED_ELF_AUXV >= 14, "not enough space on stack for auxv");
     auxp[0].a_type     = AT_PHDR;
     auxp[0].a_un.a_val = (__typeof(auxp[0].a_un.a_val))g_exec_map->l_phdr;
     auxp[1].a_type     = AT_PHNUM;
@@ -1131,12 +1130,26 @@ noreturn void execute_elf_object(struct link_map* exec_map, void* argp, elf_auxv
     auxp[6].a_un.a_val = sizeof(elf_phdr_t);
     auxp[7].a_type     = AT_SYSINFO_EHDR;
     auxp[7].a_un.a_val = (uint64_t)g_vdso_addr;
-    auxp[8].a_type     = AT_NULL;
+    auxp[8].a_type     = AT_SECURE;
     auxp[8].a_un.a_val = 0;
+
+    struct libos_thread* cur_thread = get_cur_thread();
+    /* no need to take thread lock since this is the only app thread at this point */
+    auxp[ 9].a_type     = AT_UID;
+    auxp[ 9].a_un.a_val = cur_thread->uid;
+    auxp[10].a_type     = AT_EUID;
+    auxp[10].a_un.a_val = cur_thread->euid;
+    auxp[11].a_type     = AT_GID;
+    auxp[11].a_un.a_val = cur_thread->gid;
+    auxp[12].a_type     = AT_EGID;
+    auxp[12].a_un.a_val = cur_thread->egid;
+
+    auxp[13].a_type     = AT_NULL;
+    auxp[13].a_un.a_val = 0;
 
     /* populate extra memory space for aux vector data */
     static_assert(REQUIRED_ELF_AUXV_SPACE >= 16, "not enough space on stack for auxv");
-    elf_addr_t auxp_extra = (elf_addr_t)&auxp[9];
+    elf_addr_t auxp_extra = (elf_addr_t)&auxp[14];
 
     elf_addr_t random = auxp_extra; /* random 16B for AT_RANDOM */
     ret = PalRandomBitsRead((void*)random, 16);

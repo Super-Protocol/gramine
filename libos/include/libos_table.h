@@ -7,11 +7,9 @@
 
 #pragma once
 
-#if defined(__i386__) || defined(__x86_64__)
-#include <asm/ldt.h>
-#endif
-
 #include "libos_types.h"
+#include "linux_abi/futex.h"
+#include "linux_abi/sysinfo.h"
 
 typedef void (*libos_syscall_t)(void);
 
@@ -46,8 +44,8 @@ long libos_syscall_readv(unsigned long fd, struct iovec* vec, unsigned long vlen
 long libos_syscall_writev(unsigned long fd, struct iovec* vec, unsigned long vlen);
 long libos_syscall_access(const char* file, mode_t mode);
 long libos_syscall_pipe(int* fildes);
-long libos_syscall_select(int nfds, fd_set* readfds, fd_set* writefds, fd_set* errorfds,
-                          struct __kernel_timeval* timeout);
+long libos_syscall_select(int nfds, struct linux_fd_set* readfds, struct linux_fd_set* writefds,
+                          struct linux_fd_set* errorfds, struct __kernel_timeval* timeout);
 long libos_syscall_sched_yield(void);
 long libos_syscall_msync(unsigned long start, size_t len, int flags);
 long libos_syscall_mincore(void* start, size_t len, unsigned char* vec);
@@ -89,8 +87,9 @@ long libos_syscall_waitid(int which, pid_t id, siginfo_t* infop, int options,
                           struct __kernel_rusage* ru);
 long libos_syscall_wait4(pid_t pid, int* stat_addr, int options, struct __kernel_rusage* ru);
 long libos_syscall_kill(pid_t pid, int sig);
-long libos_syscall_uname(struct new_utsname* buf);
+long libos_syscall_uname(struct linux_new_utsname* buf);
 long libos_syscall_fcntl(int fd, int cmd, unsigned long arg);
+long libos_syscall_flock(unsigned int fd, unsigned int cmd);
 long libos_syscall_fsync(int fd);
 long libos_syscall_fdatasync(int fd);
 long libos_syscall_truncate(const char* path, loff_t length);
@@ -181,8 +180,9 @@ long libos_syscall_renameat(int olddfd, const char* pathname, int newdfd, const 
 long libos_syscall_fchmodat(int dfd, const char* filename, mode_t mode);
 long libos_syscall_fchownat(int dfd, const char* filename, uid_t user, gid_t group, int flags);
 long libos_syscall_faccessat(int dfd, const char* filename, mode_t mode);
-long libos_syscall_pselect6(int nfds, fd_set* readfds, fd_set* writefds, fd_set* exceptfds,
-                            struct __kernel_timespec* tsp, void* sigmask_argpack);
+long libos_syscall_pselect6(int nfds, struct linux_fd_set* readfds, struct linux_fd_set* writefds,
+                            struct linux_fd_set* exceptfds, struct __kernel_timespec* tsp,
+                            void* sigmask_argpack);
 long libos_syscall_ppoll(struct pollfd* fds, unsigned int nfds, struct timespec* tsp,
                          const __sigset_t* sigmask_ptr, size_t sigsetsize);
 long libos_syscall_set_robust_list(struct robust_list_head* head, size_t len);
@@ -202,25 +202,7 @@ long libos_syscall_prlimit64(pid_t pid, int resource, const struct __kernel_rlim
 long libos_syscall_sendmmsg(int fd, struct mmsghdr* msg, unsigned int vlen, unsigned int flags);
 long libos_syscall_eventfd2(unsigned int count, int flags);
 long libos_syscall_eventfd(unsigned int count);
-long libos_syscall_getcpu(unsigned* cpu, unsigned* node, struct getcpu_cache* unused);
+long libos_syscall_getcpu(unsigned* cpu, unsigned* node, void* unused_cache);
 long libos_syscall_getrandom(char* buf, size_t count, unsigned int flags);
 long libos_syscall_mlock2(unsigned long start, size_t len, int flags);
 long libos_syscall_sysinfo(struct sysinfo* info);
-
-#define GRND_NONBLOCK 0x0001
-#define GRND_RANDOM   0x0002
-#define GRND_INSECURE 0x0004
-
-#ifndef MADV_FREE
-#define MADV_FREE 8
-#endif
-#ifdef __x86_64__
-#ifndef MADV_WIPEONFORK
-#define MADV_WIPEONFORK 18
-#endif
-#ifndef MADV_KEEPONFORK
-#define MADV_KEEPONFORK 19
-#endif
-#else /* __x86_64__ */
-#error "Unsupported platform"
-#endif

@@ -1,24 +1,31 @@
-FROM ubuntu:20.04
+ARG UBUNTU_IMAGE=ubuntu:20.04
 
-RUN apt update
-RUN DEBIAN_FRONTEND=noninteractive apt install -y curl gnupg2 binutils
+FROM ${UBUNTU_IMAGE}
 
-RUN curl -fsSLo /usr/share/keyrings/gramine-keyring.gpg https://packages.gramineproject.io/gramine-keyring.gpg
-RUN echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/gramine-keyring.gpg] https://packages.gramineproject.io/ focal main' > /etc/apt/sources.list.d/gramine.list
+# ARGs cannot be grouped since each FROM in a Dockerfile initiates a new build
+# stage, resulting in the loss of ARG values from earlier stages.
+ARG UBUNTU_CODENAME=focal
 
-RUN curl -fsSL https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key | apt-key add -
-RUN echo 'deb [arch=amd64] https://download.01.org/intel-sgx/sgx_repo/ubuntu focal main' > /etc/apt/sources.list.d/intel-sgx.list
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y curl gnupg2 binutils
 
-RUN apt update
+RUN curl -fsSLo /usr/share/keyrings/gramine-keyring.gpg https://packages.gramineproject.io/gramine-keyring.gpg && \
+    echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/gramine-keyring.gpg] https://packages.gramineproject.io/ '${UBUNTU_CODENAME}' main' > /etc/apt/sources.list.d/gramine.list
 
-RUN DEBIAN_FRONTEND=noninteractive apt install -y gramine \
+RUN curl -fsSLo /usr/share/keyrings/intel-sgx-deb.key https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key && \
+    echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/intel-sgx-deb.key] https://download.01.org/intel-sgx/sgx_repo/ubuntu '${UBUNTU_CODENAME}' main' > /etc/apt/sources.list.d/intel-sgx.list
+
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y gramine \
     sgx-aesm-service \
     libsgx-aesm-launch-plugin \
     libsgx-aesm-epid-plugin \
     libsgx-aesm-quote-ex-plugin \
     libsgx-aesm-ecdsa-plugin \
     libsgx-dcap-quote-verify \
-    psmisc
+    psmisc && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /var/run/aesmd/
 

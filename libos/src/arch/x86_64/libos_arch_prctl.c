@@ -5,11 +5,11 @@
  *                    Borys Popławski <borysp@invisiblethingslab.com>
  */
 
-#include <asm/prctl.h>
-
 #include "libos_internal.h"
 #include "libos_table.h"
 #include "libos_tcb.h"
+#include "linux_abi/errors.h"
+#include "linux_abi/process.h"
 #include "pal.h"
 
 /* Linux v5.16 supports Intel AMX. To enable this feature, Linux added several XSTATE-related
@@ -36,6 +36,9 @@ long libos_syscall_arch_prctl(int code, unsigned long addr) {
             return 0;
 
         case ARCH_GET_FS:
+            if (!is_user_memory_writable((unsigned long*)addr, sizeof(unsigned long))) {
+                return -EFAULT;
+            }
             return pal_to_unix_errno(PalSegmentBaseGet(PAL_SEGMENT_FS, (unsigned long*)addr));
 
         /* Emulate ARCH_GET_XCOMP_SUPP, ARCH_GET_XCOMP_PERM, ARCH_REQ_XCOMP_PERM by querying CPUID,

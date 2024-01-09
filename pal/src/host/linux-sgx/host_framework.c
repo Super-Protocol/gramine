@@ -189,27 +189,18 @@ int create_enclave(sgx_arch_secs_t* secs, sgx_arch_token_t* token) {
 #endif
 
     uint64_t addr = DO_SYSCALL(mmap, request_mmap_addr, request_mmap_size,
-                               PROT_READ | PROT_WRITE | PROT_EXEC, MAP_FIXED | MAP_SHARED,
+                               PROT_READ | PROT_WRITE | PROT_EXEC, MAP_FIXED_NOREPLACE | MAP_SHARED,
                                g_isgx_device, 0);
-    if (IS_PTR_ERR(addr) && PTR_TO_ERR(addr) == -EACCES) {
-        /* OOT DCAP driver (e.g. v1.33.2 found on MS Azure VMs with Ubuntu 18.04) requires
-         * different mmap flags */
-        /* TODO: remove this fallback after we drop Ubuntu 18.04 */
-        addr = DO_SYSCALL(mmap, request_mmap_addr, request_mmap_size,
-                          PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    }
-
     if (IS_PTR_ERR(addr)) {
         int ret = PTR_TO_ERR(addr);
         if (ret == -EPERM) {
             log_error("Permission denied on mapping enclave. "
-                      "You may need to set sysctl vm.mmap_min_addr to zero");
+                      "You may need to set sysctl vm.mmap_min_addr to zero.");
         }
 
         log_error("Allocation of EPC memory failed: %s", unix_strerror(ret));
         return ret;
     }
-
     assert(addr == request_mmap_addr);
 
     struct sgx_enclave_create param = {
@@ -218,13 +209,14 @@ int create_enclave(sgx_arch_secs_t* secs, sgx_arch_token_t* token) {
     int ret = DO_SYSCALL(ioctl, g_isgx_device, SGX_IOC_ENCLAVE_CREATE, &param);
 
     if (ret < 0) {
-        log_error("Enclave creation IOCTL failed: %s", unix_strerror(ret));
+        if (ret == -EIO) {
+            log_error("Enclave creation IOCTL failed with %s. Probably your manifest requires "
+                      "CPU features (e.g. `sgx.require_avx512`) that are not available on this "
+                      "platform.", unix_strerror(ret));
+        } else {
+            log_error("Enclave creation IOCTL failed: %s", unix_strerror(ret));
+        }
         return ret;
-    }
-
-    if (ret) {
-        log_error("Enclave creation IOCTL failed: %s", unix_strerror(ret));
-        return -EPERM;
     }
 
     secs->attributes.flags |= SGX_FLAGS_INITIALIZED;
@@ -236,8 +228,6 @@ int create_enclave(sgx_arch_secs_t* secs, sgx_arch_token_t* token) {
     log_debug("    attr.flags:     0x%016lx", secs->attributes.flags);
     log_debug("    attr.xfrm:      0x%016lx", secs->attributes.xfrm);
     log_debug("    ssa_frame_size: %d",       secs->ssa_frame_size);
-    log_debug("    isv_prod_id:    0x%08x",   secs->isv_prod_id);
-    log_debug("    isv_svn:        0x%08x",   secs->isv_svn);
 
     /* Linux v5.16 introduced support for Intel AMX feature. Any process must opt-in for AMX
      * by issuing an AMX-permission request. More technically, together with AMX, Intel introduced
@@ -413,7 +403,9 @@ int add_pages_to_enclave(sgx_arch_secs_t* secs, void* addr, void* user_addr, uns
         param.length -= added_size;
     }
 
-    /* ask Intel SGX driver to actually mmap the added enclave pages */
+    /* ask Intel SGX driver to actually mmap the added enclave pages; we can't use
+     * MAP_FIXED_NOREPLACE here because we are overwriting a subset of enclave memory already
+     * allocated in create_enclave(), see mmap request there */
     uint64_t mapped = DO_SYSCALL(mmap, addr, size, prot, MAP_FIXED | MAP_SHARED, g_isgx_device, 0);
     if (IS_PTR_ERR(mapped)) {
         ret = PTR_TO_ERR(mapped);
@@ -454,6 +446,7 @@ int edmm_restrict_pages_perm(uint64_t addr, size_t count, uint64_t prot) {
 int edmm_modify_pages_type(uint64_t addr, size_t count, uint64_t type) {
     assert(addr >= g_pal_enclave.baseaddr);
 
+    int ret;
     size_t i = 0;
     while (i < count) {
         struct sgx_enclave_modify_types params = {
@@ -461,7 +454,7 @@ int edmm_modify_pages_type(uint64_t addr, size_t count, uint64_t type) {
             .length = (count - i) * PAGE_SIZE,
             .page_type = type,
         };
-        int ret = DO_SYSCALL(ioctl, g_isgx_device, SGX_IOC_ENCLAVE_MODIFY_TYPES, &params);
+        ret = DO_SYSCALL(ioctl, g_isgx_device, SGX_IOC_ENCLAVE_MODIFY_TYPES, &params);
         assert(params.count % PAGE_SIZE == 0);
         i += params.count / PAGE_SIZE;
         if (ret < 0) {
@@ -470,6 +463,33 @@ int edmm_modify_pages_type(uint64_t addr, size_t count, uint64_t type) {
             }
             log_error("SGX_IOC_ENCLAVE_MODIFY_TYPES failed: (%llu) %s",
                       (unsigned long long)params.result, unix_strerror(ret));
+            return ret;
+        }
+    }
+
+    if (type == SGX_PAGE_TYPE_TCS) {
+        /*
+         * In-kernel SGX driver clears PTE permissions of the TCS page upon
+         * SGX_IOC_ENCLAVE_MODIFY_TYPES ioctl, and the SGX hardware clears EPCM permissions of the
+         * same TCS page upon EMODT instruction (executed as part of the ioctl). Additionally, the
+         * SGX driver sets the "max possible permissions" metadata on this TCS page as RW. Note that
+         * from this moment on, we mean classic PTE permissions; EPCM permissions always stay
+         * cleared (none) for TCS pages.
+         *
+         * When this page is accessed later, a #PF fault occurs and the Linux kernel tries to map
+         * this page into a VMA (i.e., lazy page allocation). At this point, the page-backing VMA
+         * must have permissions not exceeding "max possible permissions" saved earlier. E.g., if a
+         * VMA was initially mapped with RWX, then the #PF handler for the TCS page will fail, and
+         * the page would still be inaccessible due to cleared PTE permissions.
+         *
+         * Therefore, we must split a new VMA with RW permissions to back this TCS page, by invoking
+         * mprotect. Note that creating a VMA with only R permission results in a non-writable TCS
+         * page which makes EENTER on that TCS page fail with unrecoverable #PF, and creating a VMA
+         * with RWX permissions is explicitly prohibited by the SGX driver.
+         */
+        ret = DO_SYSCALL(mprotect, addr, count * PAGE_SIZE, PROT_READ | PROT_WRITE);
+        if (ret < 0) {
+            log_error("Changing protections of TCS pages failed: %s", unix_strerror(ret));
             return ret;
         }
     }
@@ -525,6 +545,8 @@ int init_enclave(sgx_arch_secs_t* secs, sgx_sigstruct_t* sigstruct, sgx_arch_tok
     log_debug("    mr_enclave:   %s", bytes2hex(sigstruct->enclave_hash.m,
                                                 sizeof(sigstruct->enclave_hash.m),
                                                 hex, sizeof(hex)));
+    log_debug("    isv_prod_id:  %d", sigstruct->isv_prod_id);
+    log_debug("    isv_svn:      %d", sigstruct->isv_svn);
 
     struct sgx_enclave_init param = {
 #ifdef CONFIG_SGX_DRIVER_OOT
@@ -536,8 +558,8 @@ int init_enclave(sgx_arch_secs_t* secs, sgx_sigstruct_t* sigstruct, sgx_arch_tok
 #endif
     };
     int ret = DO_SYSCALL(ioctl, g_isgx_device, SGX_IOC_ENCLAVE_INIT, &param);
-
     if (ret < 0) {
+        log_error("Enclave initialization IOCTL failed: %s", unix_strerror(ret));
         return ret;
     }
 
@@ -566,7 +588,7 @@ int init_enclave(sgx_arch_secs_t* secs, sgx_sigstruct_t* sigstruct, sgx_arch_tok
                 error = "Unknown reason";
                 break;
         }
-        log_error("enclave EINIT failed - %s", error);
+        log_error("Enclave initialization IOCTL failed: %s", error);
         return -EPERM;
     }
 

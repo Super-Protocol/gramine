@@ -6,7 +6,6 @@ import unittest
 from graminelibos.regression import (
     HAS_SGX,
     RegressionTestCase,
-    expectedFailureIf,
 )
 
 # Generic FS tests that mimic probable usage patterns in applications.
@@ -95,6 +94,37 @@ class TC_00_FileSystem(RegressionTestCase):
         self.assertIn('read(' + file_path + ') RW OK', stdout)
         self.assertIn('compare(' + file_path + ') RW OK', stdout)
         self.assertIn('close(' + file_path + ') RW OK', stdout)
+
+    # Gramine's implementation of file_map doesn't currently support shared memory-mapped regular
+    # chroot files with write permission in PAL/Linux-SGX (like mmap(PROT_WRITE, MAP_SHARED, fd)).
+    # Below test requires it, so skip it. We decided not to implement it as we don't know any
+    # workload using it.
+    @unittest.skipIf(HAS_SGX, 'mmap(PROT_WRITE, MAP_SHARED, fd) not implemented in Linux-SGX PAL')
+    def test_111_read_write_mmap(self):
+        file_path = os.path.join(self.OUTPUT_DIR, 'test_111') # new file to be created
+        stdout, stderr = self.run_binary(['read_write_mmap', file_path])
+        size = '1048576'
+        self.assertNotIn('ERROR: ', stderr)
+        self.assertTrue(os.path.isfile(file_path))
+
+        self.assertIn('open(' + file_path + ') RW (mmap) OK', stdout)
+        self.assertIn('mmap_fd(' + size + ') OK', stdout)
+        self.assertIn('read(' + file_path + ') 1 RW (mmap) OK', stdout)
+        self.assertIn('seek(' + file_path + ') 1 RW (mmap) OK', stdout)
+        self.assertIn('write(' + file_path + ') RW (mmap) OK', stdout)
+        self.assertIn('seek(' + file_path + ') 2 RW (mmap) OK', stdout)
+        self.assertIn('read(' + file_path + ') 2 RW (mmap) OK', stdout)
+        self.assertIn('compare(' + file_path + ') RW (mmap) OK', stdout)
+        self.assertIn('munmap_fd(' + size + ') OK', stdout)
+        self.assertIn('close(' + file_path + ') RW (mmap) OK', stdout)
+
+        self.assertIn('open(' + file_path + ') RW fd1 (mmap) OK', stdout)
+        self.assertIn('open(' + file_path + ') RW fd2 OK', stdout)
+        self.assertIn('mmap_fd(' + size + ') fd1 OK', stdout)
+        self.assertIn('write(' + file_path + ') RW fd2 OK', stdout)
+        self.assertIn('munmap_fd(' + size + ') fd1 OK', stdout)
+        self.assertIn('close(' + file_path + ') RW fd1 (mmap) OK', stdout)
+        self.assertIn('close(' + file_path + ') RW fd2 OK', stdout)
 
     # pylint: disable=too-many-arguments
     def verify_seek_tell(self, stdout, output_path_1, output_path_2, size):
@@ -287,15 +317,19 @@ class TC_00_FileSystem(RegressionTestCase):
     def test_203_copy_dir_sendfile(self):
         self.do_copy_test('copy_sendfile', 60)
 
-    @expectedFailureIf(HAS_SGX)
+    # Gramine's implementation of file_map doesn't currently support shared memory-mapped
+    # files with write permission in PAL/Linux-SGX (like mmap(PROT_WRITE, MAP_SHARED, fd)).
+    # These tests require it, so skip them. We decided not to implement it as we don't
+    # know any workload using it.
+    @unittest.skipIf(HAS_SGX, 'mmap(PROT_WRITE, MAP_SHARED, fd) not implemented in Linux-SGX PAL')
     def test_204_copy_dir_mmap_whole(self):
         self.do_copy_test('copy_mmap_whole', 30)
 
-    @expectedFailureIf(HAS_SGX)
+    @unittest.skipIf(HAS_SGX, 'mmap(PROT_WRITE, MAP_SHARED, fd) not implemented in Linux-SGX PAL')
     def test_205_copy_dir_mmap_seq(self):
         self.do_copy_test('copy_mmap_seq', 60)
 
-    @expectedFailureIf(HAS_SGX)
+    @unittest.skipIf(HAS_SGX, 'mmap(PROT_WRITE, MAP_SHARED, fd) not implemented in Linux-SGX PAL')
     def test_206_copy_dir_mmap_rev(self):
         self.do_copy_test('copy_mmap_rev', 60)
 

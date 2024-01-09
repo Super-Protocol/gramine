@@ -25,7 +25,6 @@ int main(int argc, char** argv, char** envp) {
     PRINT_SYMBOL(PalStreamWrite);
     PRINT_SYMBOL(PalStreamDelete);
     PRINT_SYMBOL(PalStreamMap);
-    PRINT_SYMBOL(PalStreamUnmap);
     PRINT_SYMBOL(PalStreamSetLength);
     PRINT_SYMBOL(PalStreamFlush);
     PRINT_SYMBOL(PalSendHandle);
@@ -48,7 +47,7 @@ int main(int argc, char** argv, char** envp) {
     PRINT_SYMBOL(PalEventClear);
     PRINT_SYMBOL(PalEventWait);
 
-    PRINT_SYMBOL(PalObjectClose);
+    PRINT_SYMBOL(PalObjectDestroy);
 
     PRINT_SYMBOL(PalSystemTimeQuery);
     PRINT_SYMBOL(PalRandomBitsRead);

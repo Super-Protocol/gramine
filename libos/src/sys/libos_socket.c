@@ -12,9 +12,10 @@
 #include "libos_signal.h"
 #include "libos_socket.h"
 #include "libos_table.h"
+#include "linux_abi/errors.h"
 
 /*
- * Sockets can be in 4 states: NEW, BOUND, LISTENING and CONNECTED.
+ * Sockets can be in 5 states: NEW, BOUND, LISTENING, CONNECTING and CONNECTED.
  *
  *                                                        +------------------+
  *                                                        |                  |
@@ -23,17 +24,19 @@
  *  +--> NEW --------------------> BOUND -------------> LISTEN --------------+
  *  |     |                        |   ^                                     new socket
  *  |     |                        |   |                                     |
- *  |     |                        |   |                                     |
- *  |     |              connect() |   |   disconnect()                      |
- *  |     |                        |   | (if it was bound)                   |
- *  |     | connect()              |   |                                     |
- *  |     |                        |   |                                     |
- *  |     |                        V   |                                     |
- *  |     +---------------------> CONNECTED <--------------------------------+
- *  |                              |
- *  |          disconnect()        |
- *  |      (if it was not bound)   |
- *  +------------------------------+
+ *  |     |                        |   +------------------------+            |
+ *  |     |              connect() |           disconnect()     |            |
+ *  |     |                        |         (if it was bound)  |            |
+ *  |     | connect()              |                            |            |
+ *  |     |                        |         select()/poll()/   |            |
+ *  |     |                        V            epoll()         |            |
+ *  |     +---------------------> CONNECTING ---------------> CONNECTED <----+
+ *  |                             (only for                     |
+ *  |                        non-blocking sockets)              |
+ *  |                                                           |
+ *  |                                         disconnect()      |
+ *  |                                     (if it was not bound) |
+ *  +-----------------------------------------------------------+
  *
  */
 
@@ -81,6 +84,44 @@ struct libos_handle* get_new_socket_handle(int family, int type, int protocol,
     }
 
     return handle;
+}
+
+void check_connect_inprogress_on_poll(struct libos_handle* handle, bool error_event) {
+    /*
+     * Special case of a non-blocking socket that is INPROGRESS (connecting): must check if error or
+     * success of connecting. If error, then set SO_ERROR (last_error). If success, then move to
+     * SOCK_CONNECTED state and clear SO_ERROR. See `man 2 connect`, EINPROGRESS case.
+     *
+     * We first fetch `connecting_in_progress` instead of a proper lock on the handle to speed up
+     * the common case of an already-connected socket doing recv/send.
+     */
+    assert(handle->type == TYPE_SOCK);
+
+    bool inprog = __atomic_load_n(&handle->info.sock.connecting_in_progress, __ATOMIC_ACQUIRE);
+    if (!inprog)
+        return;
+
+    struct libos_sock_handle* sock = &handle->info.sock;
+    lock(&sock->lock);
+
+    if (sock->state != SOCK_CONNECTING) {
+        /* data race: another thread could have done another select/poll on this socket and
+         * modified the state; there's nothing left to be done */
+        goto out;
+    }
+
+    if (error_event) {
+        sock->last_error = ECONNREFUSED;
+        goto out;
+    }
+
+    sock->last_error = 0;
+    sock->can_be_read = true;
+    sock->can_be_written = true;
+    __atomic_store_n(&sock->connecting_in_progress, false, __ATOMIC_RELEASE);
+    sock->state = SOCK_CONNECTED;
+out:
+    unlock(&sock->lock);
 }
 
 long libos_syscall_socket(int family, int type, int protocol) {
@@ -211,7 +252,8 @@ long libos_syscall_socketpair(int family, int type, int protocol, int* sv) {
         unlock(&sock2->lock);
         goto out;
     }
-    ret = sock2->ops->connect(handle2, &addr, sizeof(addr));
+    bool inprogress_unused;
+    ret = sock2->ops->connect(handle2, &addr, sizeof(addr), &inprogress_unused);
     if (ret < 0) {
         unlock(&sock2->lock);
         goto out;
@@ -490,11 +532,18 @@ long libos_syscall_connect(int fd, void* addr, int _addrlen) {
     switch (sock->state) {
         case SOCK_NEW:
         case SOCK_BOUND:
+        case SOCK_CONNECTING:
         case SOCK_CONNECTED:
             break;
         default:
             ret = -EINVAL;
             goto out;
+    }
+
+    if (sock->state == SOCK_CONNECTING) {
+        assert(handle->flags & O_NONBLOCK);
+        ret = -EALREADY;
+        goto out;
     }
 
     if (sock->state == SOCK_CONNECTED) {
@@ -538,16 +587,24 @@ long libos_syscall_connect(int fd, void* addr, int _addrlen) {
         goto out;
     }
 
-    ret = sock->ops->connect(handle, addr, addrlen);
+    bool inprogress;
+    ret = sock->ops->connect(handle, addr, addrlen, &inprogress);
     maybe_epoll_et_trigger(handle, ret, /*in=*/false, /*was_partial=*/false);
     if (ret < 0) {
         goto out;
     }
 
-    sock->state = SOCK_CONNECTED;
-    sock->can_be_read = true;
-    sock->can_be_written = true;
-    ret = 0;
+    if (inprogress) {
+        sock->state = SOCK_CONNECTING;
+        __atomic_store_n(&sock->connecting_in_progress, true, __ATOMIC_RELEASE);
+        sock->last_error = EINPROGRESS;
+        ret = -((int)sock->last_error);
+    } else {
+        sock->state = SOCK_CONNECTED;
+        sock->can_be_read = true;
+        sock->can_be_written = true;
+        ret = 0;
+    }
 
 out:
     if (ret == -EINTR) {
@@ -582,8 +639,9 @@ static int check_msghdr(struct msghdr* user_msg, bool is_recv) {
         }
     }
     if (user_msg->msg_control && user_msg->msg_controllen) {
-        log_warning("\"struct msghdr\" ancillary data is not supported");
-        return -ENOSYS;
+        if (!check_access_func(user_msg->msg_control, user_msg->msg_controllen)) {
+            return -EFAULT;
+        }
     }
     if (user_msg->msg_name) {
         if (user_msg->msg_namelen < 0) {
@@ -608,8 +666,9 @@ static int check_msghdr(struct msghdr* user_msg, bool is_recv) {
 
 /* We return the size directly (contrary to the usual out argument) for simplicity - this function
  * is called directly from syscall handlers, which return values in such a way. */
-ssize_t do_sendmsg(struct libos_handle* handle, struct iovec* iov, size_t iov_len, void* addr,
-                   size_t addrlen, unsigned int flags) {
+ssize_t do_sendmsg(struct libos_handle* handle, struct iovec* iov, size_t iov_len,
+                   void* msg_control, size_t msg_controllen, void* addr, size_t addrlen,
+                   unsigned int flags) {
     ssize_t ret = 0;
     if (handle->type != TYPE_SOCK) {
         return -ENOTSOCK;
@@ -633,9 +692,14 @@ ssize_t do_sendmsg(struct libos_handle* handle, struct iovec* iov, size_t iov_le
     }
 
     lock(&sock->lock);
+    if (sock->state == SOCK_CONNECTING) {
+        unlock(&sock->lock);
+        return -EAGAIN;
+    }
+
     bool has_sendtimeout_set = !!sock->sendtimeout_us;
 
-    ret = -sock->last_error;
+    ret = -((ssize_t)sock->last_error);
     sock->last_error = 0;
 
     if (!ret && !sock->can_be_written) {
@@ -654,7 +718,8 @@ ssize_t do_sendmsg(struct libos_handle* handle, struct iovec* iov, size_t iov_le
     }
 
     size_t size = 0;
-    ret = sock->ops->send(handle, iov, iov_len, &size, addr, addrlen, force_nonblocking);
+    ret = sock->ops->send(handle, iov, iov_len, msg_control, msg_controllen, &size, addr, addrlen,
+                          force_nonblocking);
     maybe_epoll_et_trigger(handle, ret, /*in=*/false, !ret ? size < total_size : false);
     if (!ret) {
         ret = size;
@@ -707,7 +772,8 @@ long libos_syscall_sendto(int fd, void* buf, size_t len, unsigned int flags, voi
         .iov_base = buf,
         .iov_len = len,
     };
-    ssize_t ret = do_sendmsg(handle, &iov, 1, addr, addr ? addrlen : 0, flags);
+    ssize_t ret = do_sendmsg(handle, &iov, 1, /*msg_control=*/NULL, /*msg_controllen=*/0, addr,
+                             addr ? addrlen : 0, flags);
     put_handle(handle);
     return ret;
 }
@@ -724,7 +790,8 @@ long libos_syscall_sendmsg(int fd, struct msghdr* msg, unsigned int flags) {
     }
 
     size_t addrlen = msg->msg_name ? msg->msg_namelen : 0;
-    ret = do_sendmsg(handle, msg->msg_iov, msg->msg_iovlen, msg->msg_name, addrlen, flags);
+    ret = do_sendmsg(handle, msg->msg_iov, msg->msg_iovlen, msg->msg_control, msg->msg_controllen,
+                     msg->msg_name, addrlen, flags);
     put_handle(handle);
     return ret;
 }
@@ -749,7 +816,8 @@ long libos_syscall_sendmmsg(int fd, struct mmsghdr* msg, unsigned int vlen, unsi
     for (size_t i = 0; i < vlen; i++) {
         struct msghdr* hdr = &msg[i].msg_hdr;
         size_t addrlen = hdr->msg_name ? hdr->msg_namelen : 0;
-        ret = do_sendmsg(handle, hdr->msg_iov, hdr->msg_iovlen, hdr->msg_name, addrlen, flags);
+        ret = do_sendmsg(handle, hdr->msg_iov, hdr->msg_iovlen, hdr->msg_control,
+                         hdr->msg_controllen, hdr->msg_name, addrlen, flags);
         if (ret < 0) {
             if (i == 0) {
                 /* Return error directly. */
@@ -776,8 +844,9 @@ out:
 
 /* We return the size directly (contrary to the usual out argument) for simplicity - this function
  * is called directly from syscall handlers, which return values in such a way. */
-ssize_t do_recvmsg(struct libos_handle* handle, struct iovec* iov, size_t iov_len, void* addr,
-                   size_t* addrlen, unsigned int* flags) {
+ssize_t do_recvmsg(struct libos_handle* handle, struct iovec* iov, size_t iov_len,
+                   void* msg_control, size_t* msg_controllen_ptr, void* addr, size_t* addrlen_ptr,
+                   unsigned int* flags) {
     ssize_t ret = 0;
     if (handle->type != TYPE_SOCK) {
         return -ENOTSOCK;
@@ -792,8 +861,14 @@ ssize_t do_recvmsg(struct libos_handle* handle, struct iovec* iov, size_t iov_le
     struct libos_sock_handle* sock = &handle->info.sock;
 
     lock(&sock->lock);
+    if (sock->state == SOCK_CONNECTING) {
+        unlock(&sock->lock);
+        return -EAGAIN;
+    }
+
     bool has_recvtimeout_set = !!sock->receivetimeout_us;
-    ret = -sock->last_error;
+
+    ret = -((ssize_t)sock->last_error);
     sock->last_error = 0;
     unlock(&sock->lock);
 
@@ -855,8 +930,9 @@ ssize_t do_recvmsg(struct libos_handle* handle, struct iovec* iov, size_t iov_le
                 force_nonblocking = true;
             }
 
-            ret = sock->ops->recv(handle, &tmp_iov, 1, &tmp_iov.iov_len, /*addr=*/NULL,
-                                  /*addrlen=*/NULL, force_nonblocking);
+            ret = sock->ops->recv(handle, &tmp_iov, 1, /*msg_control=*/NULL,
+                                  /*msg_controllen_ptr=*/NULL, &tmp_iov.iov_len, /*addr=*/NULL,
+                                  /*addrlen_ptr=*/NULL, force_nonblocking);
             if (ret == -EAGAIN && sock->peek.data_size) {
                 /* We will just return what we have already. */
                 ret = 0;
@@ -899,7 +975,8 @@ ssize_t do_recvmsg(struct libos_handle* handle, struct iovec* iov, size_t iov_le
     assert(!(*flags & MSG_PEEK));
 
     size_t size = 0;
-    ret = sock->ops->recv(handle, iov, iov_len, &size, addr, addrlen, force_nonblocking);
+    ret = sock->ops->recv(handle, iov, iov_len, msg_control, msg_controllen_ptr, &size, addr,
+                          addrlen_ptr, force_nonblocking);
     maybe_epoll_et_trigger(handle, ret, /*in=*/true, !ret ? size < total_size : false);
     if (!ret) {
         ret = *flags & MSG_TRUNC ? size : MIN(size, total_size);
@@ -949,7 +1026,8 @@ long libos_syscall_recvfrom(int fd, void* buf, size_t len, unsigned int flags, v
         .iov_base = buf,
         .iov_len = len,
     };
-    ssize_t ret = do_recvmsg(handle, &iov, 1, addr, &addrlen, &flags);
+    ssize_t ret = do_recvmsg(handle, &iov, 1, /*msg_control=*/NULL, /*msg_controllen_ptr=*/NULL,
+                             addr, &addrlen, &flags);
     if (ret >= 0 && addr) {
         *_addrlen = addrlen;
     }
@@ -969,7 +1047,8 @@ long libos_syscall_recvmsg(int fd, struct msghdr* msg, unsigned int flags) {
     }
 
     size_t addrlen = msg->msg_name ? msg->msg_namelen : 0;
-    ret = do_recvmsg(handle, msg->msg_iov, msg->msg_iovlen, msg->msg_name, &addrlen, &flags);
+    ret = do_recvmsg(handle, msg->msg_iov, msg->msg_iovlen, msg->msg_control, &msg->msg_controllen,
+                     msg->msg_name, &addrlen, &flags);
     if (ret >= 0) {
         if (msg->msg_name) {
             msg->msg_namelen = addrlen;
@@ -1014,8 +1093,8 @@ long libos_syscall_recvmmsg(int fd, struct mmsghdr* msg, unsigned int vlen, unsi
         struct msghdr* hdr = &msg[i].msg_hdr;
         size_t addrlen = hdr->msg_name ? hdr->msg_namelen : 0;
         unsigned int this_flags = flags;
-        ret = do_recvmsg(handle, hdr->msg_iov, hdr->msg_iovlen, hdr->msg_name, &addrlen,
-                         &this_flags);
+        ret = do_recvmsg(handle, hdr->msg_iov, hdr->msg_iovlen, hdr->msg_control,
+                         &hdr->msg_controllen, hdr->msg_name, &addrlen, &this_flags);
         if (ret < 0) {
             if (i == 0) {
                 /* Return error directly. */
@@ -1337,7 +1416,7 @@ long libos_syscall_getsockopt(int fd, int level, int optname, char* optval, int*
         goto out;
     }
 
-    if (!is_user_memory_writable(optlen, sizeof(*optlen))) {
+    if (!is_user_memory_readable(optlen, sizeof(*optlen))) {
         ret = -EFAULT;
         goto out;
     }
@@ -1373,6 +1452,10 @@ long libos_syscall_getsockopt(int fd, int level, int optname, char* optval, int*
     unlock(&sock->lock);
 
     if (ret == 0) {
+        if (!is_user_memory_writable(optlen, sizeof(*optlen))) {
+            ret = -EFAULT;
+            goto out;
+        }
         *optlen = len;
     }
 

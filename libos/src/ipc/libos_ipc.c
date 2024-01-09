@@ -82,7 +82,7 @@ static void put_ipc_connection(struct libos_ipc_connection* conn) {
     refcount_t ref_count = refcount_dec(&conn->ref_count);
 
     if (!ref_count) {
-        PalObjectClose(conn->handle);
+        PalObjectDestroy(conn->handle);
         destroy_lock(&conn->lock);
         free(conn);
     }
@@ -93,6 +93,16 @@ static struct libos_ipc_connection* node2conn(struct avl_tree_node* node) {
         return NULL;
     }
     return container_of(node, struct libos_ipc_connection, node);
+}
+
+static int vmid_to_uri(IDTYPE vmid, char* uri, size_t uri_size) {
+    int ret = snprintf(uri, uri_size, URI_PREFIX_PIPE "%lu/%u", g_pal_public_state->instance_id,
+                       vmid);
+    if (ret < 0 || (size_t)ret >= uri_size) {
+        return -ERANGE;
+    }
+
+    return 0;
 }
 
 static int ipc_connect(IDTYPE dest, struct libos_ipc_connection** conn_ptr) {
@@ -147,7 +157,7 @@ out:
             destroy_lock(&conn->lock);
         }
         if (conn->handle) {
-            PalObjectClose(conn->handle);
+            PalObjectDestroy(conn->handle);
         }
         free(conn);
     }
@@ -301,7 +311,7 @@ out:
     avl_tree_delete(&g_msg_waiters_tree, &waiter.node);
     unlock(&g_msg_waiters_tree_lock);
     free(waiter.response_data);
-    PalObjectClose(waiter.event);
+    PalObjectDestroy(waiter.event);
     return ret;
 }
 

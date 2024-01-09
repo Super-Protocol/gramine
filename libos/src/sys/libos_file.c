@@ -6,19 +6,28 @@
  * "chmod", "fchmod", "fchmodat", "rename", "renameat" and "sendfile".
  */
 
-#include <errno.h>
-#include <linux/fcntl.h>
-
 #include "libos_fs.h"
 #include "libos_handle.h"
 #include "libos_internal.h"
 #include "libos_lock.h"
 #include "libos_process.h"
 #include "libos_table.h"
+#include "linux_abi/errors.h"
+#include "linux_abi/fs.h"
 #include "perm.h"
 #include "stat.h"
 
-#define BUF_SIZE (64 * 1024) /* read/write in 64KB chunks for sendfile() */
+/*
+ * Read/write in 64KB chunks in the sendfile() syscall. This syscall also has an optimization of
+ * using a statically allocated buffer instead of allocating on the heap (as our internal malloc()
+ * has subpar performance). To prevent data races of multiple threads executing sendfile() at the
+ * same time and thus potentially corrupting a single static buffer, we optimize for a common case:
+ * only the first thread uses the static buffer whereas other threads fall back to a slower heap
+ * allocation.
+ */
+#define BUF_SIZE (64 * 1024)
+static char g_sendfile_buf[BUF_SIZE];
+static bool g_sendfile_buf_in_use = false;
 
 /* The kernel would look up the parent directory, and remove the child from the inode. But we are
  * working with the PAL, so we open the file, truncate and close it. */
@@ -213,35 +222,24 @@ long libos_syscall_fchmod(int fd, mode_t mode) {
     /* This isn't documented, but that's what Linux does. */
     mode_t perm = mode & 07777;
 
-    struct libos_dentry* dent = hdl->dentry;
     int ret = 0;
-
-    lock(&g_dcache_lock);
-    if (!dent) {
-        ret = -EINVAL;
-        goto out;
-    }
-
-    if (!dent->inode) {
-        /* TODO: the `chmod` callback should take a handle, not dentry; otherwise we're not able to
-         * chmod an unlinked file */
+    if (!hdl->inode) {
         ret = -ENOENT;
         goto out;
     }
 
-    struct libos_fs* fs = dent->inode->fs;
-    if (fs && fs->d_ops && fs->d_ops->chmod) {
-        ret = fs->d_ops->chmod(dent, perm);
+    struct libos_fs* fs = hdl->inode->fs;
+    if (fs && fs->fs_ops && fs->fs_ops->fchmod) {
+        ret = fs->fs_ops->fchmod(hdl, perm);
         if (ret < 0)
             goto out;
     }
 
-    lock(&dent->inode->lock);
-    dent->inode->perm = perm;
-    unlock(&dent->inode->lock);
+    lock(&hdl->inode->lock);
+    hdl->inode->perm = perm;
+    unlock(&hdl->inode->lock);
 
 out:
-    unlock(&g_dcache_lock);
     put_handle(hdl);
     return ret;
 }
@@ -379,6 +377,10 @@ long libos_syscall_renameat(int olddirfd, const char* oldpath, int newdirfd, con
 
     lock(&g_dcache_lock);
 
+    if (strcmp(oldpath, newpath) == 0) {
+        goto out;
+    }
+
     if (*oldpath != '/' && (ret = get_dirfd_dentry(olddirfd, &old_dir_dent)) < 0) {
         goto out;
     }
@@ -454,10 +456,17 @@ long libos_syscall_sendfile(int out_fd, int in_fd, off_t* offset, size_t count) 
     /* FIXME: This sendfile() emulation is very simple and not particularly efficient: it reads from
      *        input FD in BUF_SIZE chunks and writes into output FD. Mmap-based emulation may be
      *        more efficient but adds complexity (not all handle types provide mmap callback). */
-    buf = malloc(BUF_SIZE);
-    if (!buf) {
-        ret = -ENOMEM;
-        goto out;
+
+    bool buf_in_use = __atomic_exchange_n(&g_sendfile_buf_in_use, true, __ATOMIC_ACQUIRE);
+    if (!buf_in_use) {
+        /* no other thread was using the static buffer */
+        buf = g_sendfile_buf;
+    } else {
+        buf = malloc(BUF_SIZE);
+        if (!buf) {
+            ret = -ENOMEM;
+            goto out;
+        }
     }
 
     if (!count) {
@@ -545,7 +554,10 @@ out_update:
     }
 
 out:
-    free(buf);
+    if (buf == g_sendfile_buf)
+        __atomic_store_n(&g_sendfile_buf_in_use, 0, __ATOMIC_RELEASE);
+    else
+        free(buf);
     put_handle(in_hdl);
     put_handle(out_hdl);
     return copied_to_out ? (long)copied_to_out : ret;

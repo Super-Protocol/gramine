@@ -30,9 +30,9 @@
  *
  * \returns 0 on success, negative PAL error code otherwise.
  *
- * An abstract UNIX socket with name "/gramine/<instance_id>/<pipename>" is opened for listening. A
- * corresponding PAL handle with type `pipesrv` is created. This PAL handle typically serves only as
- * an intermediate step to connect two ends of the pipe (`pipecli` and `pipe`). As soon as the other
+ * An abstract UNIX socket with name "/gramine/<pipename>" is opened for listening. A corresponding
+ * PAL handle with type `pipesrv` is created. This PAL handle typically serves only as an
+ * intermediate step to connect two ends of the pipe (`pipecli` and `pipe`). As soon as the other
  * end of the pipe connects to this listening socket, a new accepted socket and the corresponding
  * PAL handle are created, and this `pipesrv` handle can be closed.
  */
@@ -40,7 +40,7 @@ static int pipe_listen(PAL_HANDLE* handle, const char* name, pal_stream_options_
     int ret;
 
     struct sockaddr_un addr;
-    ret = get_gramine_unix_socket_addr(g_pal_common_state.instance_id, name, &addr);
+    ret = get_gramine_unix_socket_addr(name, &addr);
     if (ret < 0)
         return -PAL_ERROR_DENIED;
 
@@ -96,9 +96,6 @@ static int pipe_waitforclient(PAL_HANDLE handle, PAL_HANDLE* client, pal_stream_
     if (handle->hdr.type != PAL_TYPE_PIPESRV)
         return -PAL_ERROR_NOTSERVER;
 
-    if (handle->pipe.fd == PAL_IDX_POISON)
-        return -PAL_ERROR_DENIED;
-
     static_assert(O_NONBLOCK == SOCK_NONBLOCK, "assumed below");
     int flags = PAL_OPTION_TO_LINUX_OPEN(options) | SOCK_CLOEXEC;
     int newfd = DO_SYSCALL(accept4, handle->pipe.fd, NULL, NULL, flags);
@@ -130,15 +127,15 @@ static int pipe_waitforclient(PAL_HANDLE handle, PAL_HANDLE* client, pal_stream_
  * \returns 0 on success, negative PAL error code otherwise.
  *
  * This function connects to the other end of the pipe, represented as an abstract UNIX socket
- * "/gramine/<instance_id>/<pipename>" opened for listening. When the connection succeeds, a new
- * `pipe` PAL handle is created with the corresponding underlying socket and is returned in
- * `handle`. The other end of the pipe is typically of type `pipecli`.
+ * "/gramine/<pipename>" opened for listening. When the connection succeeds, a new `pipe` PAL handle
+ * is created with the corresponding underlying socket and is returned in `handle`. The other end of
+ * the pipe is typically of type `pipecli`.
  */
 static int pipe_connect(PAL_HANDLE* handle, const char* name, pal_stream_options_t options) {
     int ret;
 
     struct sockaddr_un addr;
-    ret = get_gramine_unix_socket_addr(g_pal_common_state.instance_id, name, &addr);
+    ret = get_gramine_unix_socket_addr(name, &addr);
     if (ret < 0)
         return -PAL_ERROR_DENIED;
 
@@ -259,18 +256,21 @@ static int64_t pipe_write(PAL_HANDLE handle, uint64_t offset, size_t len, const 
 }
 
 /*!
- * \brief Close pipe.
+ * \brief Destroy pipe (close host FD and free all objects).
  *
  * \param handle  PAL handle of type `pipesrv`, `pipecli`, or `pipe`.
- *
- * \returns 0 on success, negative PAL error code otherwise.
  */
-static int pipe_close(PAL_HANDLE handle) {
-    if (handle->pipe.fd != PAL_IDX_POISON) {
-        DO_SYSCALL(close, handle->pipe.fd);
-        handle->pipe.fd = PAL_IDX_POISON;
+static void pipe_destroy(PAL_HANDLE handle) {
+    assert(handle->hdr.type == PAL_TYPE_PIPESRV || handle->hdr.type == PAL_TYPE_PIPECLI
+            || handle->hdr.type == PAL_TYPE_PIPE);
+
+    int ret = DO_SYSCALL(close, handle->pipe.fd);
+    if (ret < 0) {
+        log_error("closing pipe host fd %d failed: %s", handle->pipe.fd, unix_strerror(ret));
+        /* We cannot do anything about it anyway... */
     }
-    return 0;
+
+    free(handle);
 }
 
 /*!
@@ -297,10 +297,7 @@ static int pipe_delete(PAL_HANDLE handle, enum pal_delete_mode delete_mode) {
             return -PAL_ERROR_INVAL;
     }
 
-    if (handle->pipe.fd != PAL_IDX_POISON) {
-        DO_SYSCALL(shutdown, handle->pipe.fd, shutdown);
-    }
-
+    DO_SYSCALL(shutdown, handle->pipe.fd, shutdown);
     return 0;
 }
 
@@ -314,9 +311,6 @@ static int pipe_delete(PAL_HANDLE handle, enum pal_delete_mode delete_mode) {
  */
 static int pipe_attrquerybyhdl(PAL_HANDLE handle, PAL_STREAM_ATTR* attr) {
     int ret;
-
-    if (handle->pipe.fd == PAL_IDX_POISON)
-        return -PAL_ERROR_BADHANDLE;
 
     attr->handle_type  = handle->hdr.type;
     attr->nonblocking  = handle->pipe.nonblocking;
@@ -346,9 +340,6 @@ static int pipe_attrquerybyhdl(PAL_HANDLE handle, PAL_STREAM_ATTR* attr) {
  * Currently only `nonblocking` attribute can be set.
  */
 static int pipe_attrsetbyhdl(PAL_HANDLE handle, PAL_STREAM_ATTR* attr) {
-    if (handle->pipe.fd == PAL_IDX_POISON)
-        return -PAL_ERROR_BADHANDLE;
-
     bool* nonblocking = &handle->pipe.nonblocking;
 
     if (attr->nonblocking != *nonblocking) {
@@ -367,7 +358,7 @@ struct handle_ops g_pipe_ops = {
     .waitforclient  = &pipe_waitforclient,
     .read           = &pipe_read,
     .write          = &pipe_write,
-    .close          = &pipe_close,
+    .destroy        = &pipe_destroy,
     .delete         = &pipe_delete,
     .attrquerybyhdl = &pipe_attrquerybyhdl,
     .attrsetbyhdl   = &pipe_attrsetbyhdl,

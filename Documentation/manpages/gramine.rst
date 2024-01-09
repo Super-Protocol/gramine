@@ -1,8 +1,8 @@
 .. program:: gramine
 
-==================================================================
-:program:`gramine-direct`, :command:`gramine-sgx` -- Run something
-==================================================================
+====================================================================================
+:program:`gramine-direct`, :command:`gramine-sgx` -- Run an application with Gramine
+====================================================================================
 
 .. note::
 
@@ -19,6 +19,13 @@ Description
 
 This is the main way to invoke Gramine. The first argument is the name of the
 application (that is, name of the manifest file *without* ``.manifest``).
+
+Options
+=======
+
+.. option:: --version
+
+   Show version and exit.
 
 Environment variables
 =====================

@@ -3,13 +3,12 @@
  *                    Borys Popławski <borysp@invisiblethingslab.com>
  */
 
-#include <asm/fcntl.h>
-#include <asm/ioctls.h>
-
 #include "api.h"
 #include "libos_fs.h"
 #include "libos_lock.h"
 #include "libos_socket.h"
+#include "linux_abi/fs.h"
+#include "linux_abi/ioctl.h"
 #include "pal.h"
 #include "perm.h"
 #include "stat.h"
@@ -24,7 +23,7 @@ static int close(struct libos_handle* handle) {
     free(handle->info.sock.peek.buf);
     /* No need for atomics - we are releasing the last reference, nothing can access it anymore. */
     if (handle->info.sock.pal_handle) {
-        PalObjectClose(handle->info.sock.pal_handle);
+        PalObjectDestroy(handle->info.sock.pal_handle);
     }
     return 0;
 }
@@ -36,7 +35,8 @@ static ssize_t read(struct libos_handle* handle, void* buf, size_t size, file_of
         .iov_len = size,
     };
     unsigned int flags = 0;
-    return do_recvmsg(handle, &iov, /*iov_len=*/1, /*addr=*/NULL, /*addrlen=*/NULL, &flags);
+    return do_recvmsg(handle, &iov, /*iov_len=*/1, /*msg_control=*/NULL,
+                      /*msg_controllen_ptr=*/NULL, /*addr=*/NULL, /*addrlen_ptr=*/NULL, &flags);
 }
 
 static ssize_t write(struct libos_handle* handle, const void* buf, size_t size, file_off_t* pos) {
@@ -45,20 +45,23 @@ static ssize_t write(struct libos_handle* handle, const void* buf, size_t size, 
         .iov_base = (void*)buf,
         .iov_len = size,
     };
-    return do_sendmsg(handle, &iov, /*iov_len=*/1, /*addr=*/NULL, /*addrlen=*/0, /*flags=*/0);
+    return do_sendmsg(handle, &iov, /*iov_len=*/1, /*msg_control=*/NULL, /*msg_controllen=*/0,
+                      /*addr=*/NULL, /*addrlen=*/0, /*flags=*/0);
 }
 
 static ssize_t readv(struct libos_handle* handle, struct iovec* iov, size_t iov_len,
                      file_off_t* pos) {
     __UNUSED(pos);
     unsigned int flags = 0;
-    return do_recvmsg(handle, iov, iov_len, /*addr=*/NULL, /*addrlen=*/NULL, &flags);
+    return do_recvmsg(handle, iov, iov_len, /*msg_control=*/NULL, /*msg_controllen_ptr=*/NULL,
+                      /*addr=*/NULL, /*addrlen_ptr=*/NULL, &flags);
 }
 
 static ssize_t writev(struct libos_handle* handle, struct iovec* iov, size_t iov_len,
                       file_off_t* pos) {
     __UNUSED(pos);
-    return do_sendmsg(handle, iov, iov_len, /*addr=*/NULL, /*addrlen=*/0, /*flags=*/0);
+    return do_sendmsg(handle, iov, iov_len, /*msg_control=*/NULL, /*msg_controllen=*/0,
+                      /*addr=*/NULL, /*addrlen=*/0, /*flags=*/0);
 }
 
 static int hstat(struct libos_handle* handle, struct stat* stat) {
@@ -164,8 +167,20 @@ static int ioctl(struct libos_handle* handle, unsigned int cmd, unsigned long ar
             }
             *(int*)arg = size;
             return 0;
-        default:
-            return -ENOTTY;
+
+        default:;
+            PAL_HANDLE pal_handle = __atomic_load_n(&handle->info.sock.pal_handle,
+                                                    __ATOMIC_ACQUIRE);
+            if (!pal_handle) {
+                return -ENOTCONN;
+            }
+            int cmd_ret;
+            ret = PalDeviceIoControl(pal_handle, cmd, arg, &cmd_ret);
+            if (ret < 0) {
+                return ret == -PAL_ERROR_NOTIMPLEMENTED ? -ENOTTY: pal_to_unix_errno(ret);
+            }
+            assert(ret == 0);
+            return cmd_ret;
     }
 }
 

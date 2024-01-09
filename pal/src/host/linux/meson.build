@@ -1,4 +1,5 @@
 pal_direct_sources = files(
+    'pal_console.c',
     'pal_devices.c',
     'pal_eventfd.c',
     'pal_events.c',
@@ -73,10 +74,11 @@ libpal_direct = shared_library('pal',
 
     dependencies: [
         common_dep,
+        ioctls_dep,
     ],
 
     install: true,
-    install_dir: join_paths(pkglibdir, 'direct'),
+    install_dir: pkglibdir / 'direct',
 )
 
 libpal_direct_dep = declare_dependency(
@@ -91,15 +93,15 @@ if debug
         output: 'libpal.so.map',
 
         install: true,
-        install_dir: join_paths(pkglibdir, 'direct'),
+        install_dir: pkglibdir / 'direct',
     )
 
     install_data(
         'gdb_integration/gramine_linux_gdb.py',
-        install_dir: join_paths(pkglibdir, 'direct/gdb_integration'),
+        install_dir: pkglibdir / 'direct/gdb_integration',
     )
 endif
 
 meson.add_install_script('/bin/sh', '-c',
     'ln -sf libpal.so "$MESON_INSTALL_DESTDIR_PREFIX"/@0@'.format(
-        join_paths(pkglibdir, 'direct/loader')))
+        pkglibdir / 'direct/loader'))

@@ -14,8 +14,8 @@
  *   using this flag,
  * - adding an epoll to another epoll instance is not supported, but should be implementable without
  *   design changes if need be,
- * - `EPOLLRDHUP` is not reported and `EPOLLHUP` is always reported together with `EPOLLERR` - this
- *   is current limitation of PAL API, which does not distinguish these conditions.
+ * - `EPOLLRDHUP` is always reported together with `EPOLLHUP` - this is current limitation of PAL
+ *   API, which does not distinguish these conditions.
  */
 
 #include <stdint.h>
@@ -28,9 +28,11 @@
 #include "libos_pollable_event.h"
 #include "libos_refcount.h"
 #include "libos_signal.h"
+#include "libos_socket.h"
 #include "libos_table.h"
 #include "libos_thread.h"
 #include "libos_types.h"
+#include "linux_abi/errors.h"
 #include "list.h"
 
 /* This bit is currently unoccupied in epoll events mask. */
@@ -658,14 +660,24 @@ static int do_epoll_wait(int epfd, struct epoll_event* events, int maxevents, in
 
             uint32_t this_item_events = 0;
             if (pal_ret_events[i] & PAL_WAIT_ERROR) {
-                /* XXX: unfortunately there is no way to distinguish these two. */
-                this_item_events |= EPOLLERR | EPOLLHUP;
+                this_item_events |= EPOLLERR;
+            }
+            if (pal_ret_events[i] & PAL_WAIT_HANG_UP) {
+                this_item_events |= EPOLLHUP;
+                /* add RDHUP event only if user requested for it to be reported */
+                this_item_events |= items[i]->events & EPOLLRDHUP;
             }
             if (pal_ret_events[i] & PAL_WAIT_READ) {
                 this_item_events |= items[i]->events & (EPOLLIN | EPOLLRDNORM);
             }
             if (pal_ret_events[i] & PAL_WAIT_WRITE) {
                 this_item_events |= items[i]->events & (EPOLLOUT | EPOLLWRNORM);
+            }
+
+            if (items[i]->handle->type == TYPE_SOCK &&
+                    (pal_ret_events[i] & (PAL_WAIT_READ | PAL_WAIT_WRITE))) {
+                bool error_event = !!(pal_ret_events[i] & (PAL_WAIT_ERROR | PAL_WAIT_HANG_UP));
+                check_connect_inprogress_on_poll(items[i]->handle, error_event);
             }
 
             if (!this_item_events) {

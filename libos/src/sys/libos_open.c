@@ -8,10 +8,7 @@
 
 #define _POSIX_C_SOURCE 200809L  /* for SSIZE_MAX */
 
-#include <errno.h>
 #include <limits.h>
-#include <linux/fadvise.h>
-#include <linux/fcntl.h>
 #include <stdalign.h>
 
 #include "libos_fs.h"
@@ -20,6 +17,9 @@
 #include "libos_lock.h"
 #include "libos_process.h"
 #include "libos_table.h"
+#include "linux_abi/errors.h"
+#include "linux_abi/fs.h"
+#include "linux_abi/memory.h"
 #include "stat.h"
 
 ssize_t do_handle_read(struct libos_handle* hdl, void* buf, size_t count) {
@@ -105,6 +105,11 @@ long libos_syscall_openat(int dfd, const char* filename, int flags, int mode) {
     flags &= O_ACCMODE | O_APPEND |  O_CLOEXEC | O_CREAT | O_DIRECT | O_DIRECTORY | O_DSYNC | O_EXCL
              | O_LARGEFILE | O_NOATIME | O_NOCTTY | O_NOFOLLOW | O_NONBLOCK | O_PATH | O_SYNC
              | O_TMPFILE | O_TRUNC;
+
+    if (   (flags & O_ACCMODE) != O_RDONLY
+        && (flags & O_ACCMODE) != O_WRONLY
+        && (flags & O_ACCMODE) != O_RDWR)
+        return -EINVAL;
 
     /* TODO: fail explicitly on valid but unsupported flags. */
 

@@ -52,14 +52,16 @@ The official Gramine documentation can be found at
 https://gramine.readthedocs.io. Below are quick links to some of the most
 important pages:
 
-- `Quick start and how to run applications
-  <https://gramine.readthedocs.io/en/latest/quickstart.html>`__
+- `Gramine installation options
+  <https://gramine.readthedocs.io/en/latest/installation.html>`__
+- `Run a sample application
+  <https://gramine.readthedocs.io/en/latest/run-sample-application.html>`__
 - `Complete building instructions
   <https://gramine.readthedocs.io/en/latest/devel/building.html>`__
 - `Gramine manifest file syntax
   <https://gramine.readthedocs.io/en/latest/manifest-syntax.html>`__
 - `Performance tuning & analysis of SGX applications in Gramine
-  <https://gramine.readthedocs.io/en/latest/devel/performance.html>`__
+  <https://gramine.readthedocs.io/en/latest/performance.html>`__
 - `Remote attestation in Gramine
   <https://gramine.readthedocs.io/en/latest/attestation.html>`__
 
@@ -88,4 +90,5 @@ If you prefer emails, please send them to users@gramineproject.io
 Reporting security issues
 =========================
 
-Please report security issues to security@gramineproject.io.
+Please report security issues to security@gramineproject.io. See also our
+`security policy <SECURITY.md>`__.
