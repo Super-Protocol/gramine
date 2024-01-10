@@ -292,7 +292,7 @@ static int encrypted_file_internal_open(struct libos_encrypted_file* enc, PAL_HA
     ret = 0;
 out:
     free(normpath);
-    if (ret < 0)
+    if (ret < 0 && !!pal_handle)
         PalObjectDestroy(pal_handle);
     return ret;
 }
