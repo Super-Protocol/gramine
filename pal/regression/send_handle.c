@@ -1,6 +1,7 @@
 #include "api.h"
 #include "pal.h"
 #include "pal_regression.h"
+#include "socket_utils.h"
 
 #define MSG "Some message."
 #define MSG_SIZE (static_strlen(MSG))
@@ -95,32 +96,33 @@ static void do_parent(void) {
     CHECK(PalStreamOpen("pipe.srv:1", PAL_ACCESS_RDWR, /*share_flags=*/0, PAL_CREATE_IGNORED,
                         /*options=*/0, &handle));
     CHECK(PalSendHandle(child_process, handle));
-    PalObjectClose(handle);
+    PalObjectDestroy(handle);
 
     CHECK(PalStreamOpen("pipe:1", PAL_ACCESS_RDWR, /*share_flags=*/0, PAL_CREATE_IGNORED,
                         /*options=*/0, &handle));
     recv_and_check(handle, PAL_TYPE_PIPE);
-    PalObjectClose(handle);
+    PalObjectDestroy(handle);
 
     /* TCP socket */
     CHECK(PalSocketCreate(PAL_IPV4, PAL_SOCKET_TCP, /*options=*/0, &handle));
     struct pal_socket_addr addr = {
         .domain = PAL_IPV4,
         .ipv4 = {
-            .addr = __htonl(0x7f000001), // localhost
-            .port = __htons(PORT),
+            .addr = htonl(0x7f000001), // localhost
+            .port = htons(PORT),
         },
     };
     set_reuseaddr(handle);
     CHECK(PalSocketBind(handle, &addr));
     CHECK(PalSocketListen(handle, /*backlog=*/3));
     CHECK(PalSendHandle(child_process, handle));
-    PalObjectClose(handle);
+    PalObjectDestroy(handle);
 
+    bool connect_inprogress_unused;
     CHECK(PalSocketCreate(PAL_IPV4, PAL_SOCKET_TCP, /*options=*/0, &handle));
-    CHECK(PalSocketConnect(handle, &addr, /*local_addr=*/NULL));
+    CHECK(PalSocketConnect(handle, &addr, /*local_addr=*/NULL, &connect_inprogress_unused));
     recv_and_check(handle, PAL_TYPE_SOCKET);
-    PalObjectClose(handle);
+    PalObjectDestroy(handle);
 
     /* UDP IPv6 socket */
     CHECK(PalSocketCreate(PAL_IPV6, PAL_SOCKET_UDP, /*options=*/0, &handle));
@@ -128,25 +130,25 @@ static void do_parent(void) {
         .domain = PAL_IPV6,
         .ipv6 = {
             .addr = { [15] = 1 }, // localhost
-            .port = __htons(PORT),
+            .port = htons(PORT),
         },
     };
     set_reuseaddr(handle);
     CHECK(PalSocketBind(handle, &addr));
     CHECK(PalSendHandle(child_process, handle));
-    PalObjectClose(handle);
+    PalObjectDestroy(handle);
 
     CHECK(PalSocketCreate(PAL_IPV6, PAL_SOCKET_UDP, /*options=*/0, &handle));
-    CHECK(PalSocketConnect(handle, &addr, /*local_addr=*/NULL));
+    CHECK(PalSocketConnect(handle, &addr, /*local_addr=*/NULL, &connect_inprogress_unused));
     write_msg(handle, PAL_TYPE_SOCKET);
-    PalObjectClose(handle);
+    PalObjectDestroy(handle);
 
     /* file handle */
     CHECK(PalStreamOpen("file:to_send.tmp", PAL_ACCESS_RDWR, /*share_flags=*/0600, PAL_CREATE_TRY,
                         /*options=*/0, &handle));
     write_msg(handle, PAL_TYPE_FILE);
     CHECK(PalSendHandle(child_process, handle));
-    PalObjectClose(handle);
+    PalObjectDestroy(handle);
 }
 
 static void do_child(void) {
@@ -156,27 +158,27 @@ static void do_child(void) {
     CHECK(PalReceiveHandle(PalGetPalPublicState()->parent_process, &handle));
     PAL_HANDLE client_handle;
     CHECK(PalStreamWaitForClient(handle, &client_handle, /*options=*/0));
-    PalObjectClose(handle);
+    PalObjectDestroy(handle);
     write_msg(client_handle, PAL_TYPE_PIPECLI);
-    PalObjectClose(client_handle);
+    PalObjectDestroy(client_handle);
 
     /* TCP socket */
     CHECK(PalReceiveHandle(PalGetPalPublicState()->parent_process, &handle));
     CHECK(PalSocketAccept(handle, /*options=*/0, &client_handle, /*out_client_addr=*/NULL,
                           /*out_local_addr=*/NULL));
-    PalObjectClose(handle);
+    PalObjectDestroy(handle);
     write_msg(client_handle, PAL_TYPE_SOCKET);
-    PalObjectClose(client_handle);
+    PalObjectDestroy(client_handle);
 
     /* UDP IPv6 socket */
     CHECK(PalReceiveHandle(PalGetPalPublicState()->parent_process, &handle));
     recv_and_check(handle, PAL_TYPE_SOCKET);
-    PalObjectClose(handle);
+    PalObjectDestroy(handle);
 
     /* file handle */
     CHECK(PalReceiveHandle(PalGetPalPublicState()->parent_process, &handle));
     recv_and_check(handle, PAL_TYPE_FILE);
-    PalObjectClose(handle);
+    PalObjectDestroy(handle);
 }
 
 int main(int argc, char* argv[]) {

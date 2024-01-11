@@ -11,14 +11,15 @@
 
 #include "libos_fs.h"
 #include "libos_socket.h"
+#include "linux_socket.h"
 #include "pal.h"
 #include "socket_utils.h"
 
-static int verify_sockaddr(int expected_family, void* addr, size_t* addrlen) {
+static int verify_sockaddr(int expected_family, void* addr, size_t* addrlen_ptr) {
     unsigned short family;
     switch (expected_family) {
         case AF_INET:
-            if (*addrlen < sizeof(struct sockaddr_in)) {
+            if (*addrlen_ptr < sizeof(struct sockaddr_in)) {
                 return -EINVAL;
             }
             memcpy(&family, (char*)addr + offsetof(struct sockaddr_in, sin_family), sizeof(family));
@@ -27,10 +28,10 @@ static int verify_sockaddr(int expected_family, void* addr, size_t* addrlen) {
             }
             /* Cap the address at the maximal possible size - rest of the input buffer (if any) is
              * ignored. */
-            *addrlen = sizeof(struct sockaddr_in);
+            *addrlen_ptr = sizeof(struct sockaddr_in);
             break;
         case AF_INET6:
-            if (*addrlen < sizeof(struct sockaddr_in6)) {
+            if (*addrlen_ptr < sizeof(struct sockaddr_in6)) {
                 return -EINVAL;
             }
             memcpy(&family, (char*)addr + offsetof(struct sockaddr_in6, sin6_family),
@@ -40,7 +41,7 @@ static int verify_sockaddr(int expected_family, void* addr, size_t* addrlen) {
             }
             /* Cap the address at the maximal possible size - rest of the input buffer (if any) is
              * ignored. */
-            *addrlen = sizeof(struct sockaddr_in6);
+            *addrlen_ptr = sizeof(struct sockaddr_in6);
             break;
         default:
             BUG();
@@ -56,7 +57,7 @@ static bool is_linux_sockaddr_any(const void* linux_addr) {
         case AF_INET:;
             struct sockaddr_in sa_ipv4;
             memcpy(&sa_ipv4, linux_addr, sizeof(sa_ipv4));
-            if (sa_ipv4.sin_addr.s_addr == __htonl(INADDR_ANY)) {
+            if (sa_ipv4.sin_addr.s_addr == htonl(INADDR_ANY)) {
                 return true;
             }
             break;
@@ -178,7 +179,7 @@ static int accept(struct libos_handle* handle, bool is_nonblocking,
                                                                handle->info.sock.protocol,
                                                                is_nonblocking);
     if (!client_handle) {
-        PalObjectClose(client_pal_handle);
+        PalObjectDestroy(client_pal_handle);
         return -ENOMEM;
     }
 
@@ -207,7 +208,7 @@ static int accept(struct libos_handle* handle, bool is_nonblocking,
     return 0;
 }
 
-static int connect(struct libos_handle* handle, void* addr, size_t addrlen) {
+static int connect(struct libos_handle* handle, void* addr, size_t addrlen, bool* out_inprogress) {
     struct libos_sock_handle* sock = &handle->info.sock;
     assert(locked(&sock->lock));
 
@@ -220,9 +221,8 @@ static int connect(struct libos_handle* handle, void* addr, size_t addrlen) {
     linux_to_pal_sockaddr(addr, &pal_remote_addr);
     struct pal_socket_addr pal_local_addr;
 
-    /* XXX: this connect is always blocking (regardless of actual setting of nonblockingness on
-     * `sock->pal_handle`. See also the comment in tcp connect implementation in Linux PAL. */
-    ret = PalSocketConnect(sock->pal_handle, &pal_remote_addr, &pal_local_addr);
+    bool inprogress;
+    ret = PalSocketConnect(sock->pal_handle, &pal_remote_addr, &pal_local_addr, &inprogress);
     if (ret < 0) {
         return ret == -PAL_ERROR_CONNFAILED ? -ECONNREFUSED : pal_to_unix_errno(ret);
     }
@@ -234,6 +234,7 @@ static int connect(struct libos_handle* handle, void* addr, size_t addrlen) {
         assert(!sock->was_bound);
         pal_to_linux_sockaddr(&pal_local_addr, &sock->local_addr, &sock->local_addrlen);
     }
+    *out_inprogress = inprogress;
     return 0;
 }
 
@@ -244,7 +245,9 @@ static int disconnect(struct libos_handle* handle) {
     struct pal_socket_addr pal_ip_addr = {
         .domain = PAL_DISCONNECT,
     };
-    int ret = PalSocketConnect(sock->pal_handle, &pal_ip_addr, /*local_addr=*/NULL);
+    bool inprogress_unused;
+    int ret = PalSocketConnect(sock->pal_handle, &pal_ip_addr, /*local_addr=*/NULL,
+                               &inprogress_unused);
     return pal_to_unix_errno(ret);
 }
 
@@ -662,12 +665,53 @@ static int getsockopt(struct libos_handle* handle, int level, int optname, void*
     }
 }
 
-static int send(struct libos_handle* handle, struct iovec* iov, size_t iov_len, size_t* out_size,
-                void* addr, size_t addrlen, bool force_nonblocking) {
+static int send(struct libos_handle* handle, struct iovec* iov, size_t iov_len, void* msg_control,
+                size_t msg_controllen, size_t* out_size, void* addr, size_t addrlen,
+                bool force_nonblocking) {
     assert(handle->type == TYPE_SOCK);
 
     struct libos_sock_handle* sock = &handle->info.sock;
     struct sockaddr_storage sock_addr;
+
+    struct cmsghdr* cmsg = (struct cmsghdr*)msg_control;
+    size_t rest_msg_controllen = msg_controllen;
+    while (cmsg && rest_msg_controllen >= sizeof(struct cmsghdr)) {
+        if (cmsg->cmsg_len < sizeof(struct cmsghdr) ||
+                CMSG_ALIGN(cmsg->cmsg_len) > rest_msg_controllen) {
+            return -EINVAL;
+        }
+
+        if (cmsg->cmsg_level != SOL_SOCKET) {
+            /*
+             * We currently don't support:
+             * - SOL_UDP:  UDP_SEGMENT
+             * - SOL_IPV6: IPV6_PKTINFO
+             * - SOL_IP:   IP_RETOPTS, IP_PKTINFO, IP_TTL, IP_TOS
+             *
+             * Note that there are no cmsgs for TCP (SOL_TCP) in Linux (as of v6.0).
+             */
+            return -EINVAL;
+        }
+
+        switch (cmsg->cmsg_type) {
+            /* We currently don't support below SOL_SOCKET types. */
+            case SO_MARK:
+            case SO_TIMESTAMPING_OLD:
+            case SCM_TXTIME:
+                return -EINVAL;
+
+            /* SCM_RIGHTS and SCM_CREDENTIALS are semantically in SOL_UNIX, simply ignored */
+            case SCM_RIGHTS:
+            case SCM_CREDENTIALS:
+                break;
+
+            default:
+                return -EINVAL;
+        }
+
+        rest_msg_controllen -= CMSG_ALIGN(cmsg->cmsg_len);
+        cmsg = (struct cmsghdr*)((char*)cmsg + CMSG_ALIGN(cmsg->cmsg_len));
+    }
 
     switch (sock->type) {
         case SOCK_STREAM:
@@ -709,15 +753,16 @@ static int send(struct libos_handle* handle, struct iovec* iov, size_t iov_len, 
     return ret;
 }
 
-static int recv(struct libos_handle* handle, struct iovec* iov, size_t iov_len,
-                size_t* out_total_size, void* addr, size_t* addrlen, bool force_nonblocking) {
+static int recv(struct libos_handle* handle, struct iovec* iov, size_t iov_len, void* msg_control,
+                size_t* msg_controllen_ptr, size_t* out_total_size, void* addr, size_t* addrlen_ptr,
+                bool force_nonblocking) {
     assert(handle->type == TYPE_SOCK);
 
     switch (handle->info.sock.type) {
         case SOCK_STREAM:
             /* TCP - not interested in remote address (we know it already). */
             addr = NULL;
-            addrlen = NULL;
+            addrlen_ptr = NULL;
             break;
         case SOCK_DGRAM:
             break;
@@ -731,14 +776,29 @@ static int recv(struct libos_handle* handle, struct iovec* iov, size_t iov_len,
     if (ret < 0) {
         return pal_to_unix_errno(ret);
     }
+
+    if (msg_control && msg_controllen_ptr) {
+        /*
+         * We currently don't support:
+         * - SOL_TCP:    TCP_CM_INQ
+         * - SOL_SOCKET: SO_TIMESTAMPNS_NEW, SO_TIMESTAMPNS_OLD, SO_TIMESTAMP_NEW, SO_TIMESTAMP_OLD
+         * - SOL_IPV6:   IPV6_PKTINFO
+         * - SOL_IP:     IP_RETOPTS, IP_RECVOPTS, IP_PKTINFO, IP_TTL, IP_TOS, IP_RECVFRAGSIZE,
+         *               IP_CHECKSUM, SCM_SECURITY, IP_ORIGDSTADDR, IP_RECVERR
+         *
+         *  Note that SCM_RIGHTS and SCM_CREDENTIALS are not possible on TCP/UDP sockets.
+         */
+        *msg_controllen_ptr = 0;
+    }
+
     if (addr) {
         struct sockaddr_storage linux_addr;
         size_t linux_addr_len = sizeof(linux_addr);
         pal_to_linux_sockaddr(&pal_ip_addr, &linux_addr, &linux_addr_len);
         /* If the user provided buffer is too small, the address is truncated, but we report
-         * the actual address size in `addrlen`. */
-        memcpy(addr, &linux_addr, MIN(*addrlen, linux_addr_len));
-        *addrlen = linux_addr_len;
+         * the actual address size in `addrlen_ptr`. */
+        memcpy(addr, &linux_addr, MIN(*addrlen_ptr, linux_addr_len));
+        *addrlen_ptr = linux_addr_len;
     }
     return 0;
 }

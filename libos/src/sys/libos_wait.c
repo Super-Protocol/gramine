@@ -3,10 +3,6 @@
  *                    Borys Popławski <borysp@invisiblethingslab.com>
  */
 
-#include <stddef.h> /* needed by <linux/signal.h> for size_t */
-
-#include <linux/signal.h>
-#include <linux/wait.h>
 #include <stdbool.h>
 
 #include "api.h"
@@ -18,6 +14,9 @@
 #include "libos_table.h"
 #include "libos_thread.h"
 #include "libos_types.h"
+#include "linux_abi/errors.h"
+#include "linux_abi/process.h"
+#include "linux_abi/signals.h"
 
 /* For wait4() return value */
 #define WCOREFLAG 0x80
@@ -105,17 +104,20 @@ static long do_waitid(int which, pid_t id, siginfo_t* infop, int options) {
     }
 
     if (options & WSTOPPED) {
-        log_warning("Ignoring unsupported WSTOPPED flag to wait4");
+        log_warning("Ignoring unsupported WSTOPPED flag to waitid/wait4");
         options &= ~WSTOPPED;
     }
     if (options & WCONTINUED) {
-        log_warning("Ignoring unsupported WCONTINUED flag to wait4");
+        log_warning("Ignoring unsupported WCONTINUED flag to waitid/wait4");
         options &= ~WCONTINUED;
     }
-    assert(options & WEXITED);
+    if (!(options & WEXITED)) {
+        log_error("Unsupported combination of flags passed to waitid/wait4");
+        return -EINVAL;
+    }
 
     if (options & __WNOTHREAD) {
-        log_warning("Ignoring unsupported __WNOTHREAD flag to wait4");
+        log_warning("Ignoring unsupported __WNOTHREAD flag to waitid/wait4");
         options &= ~__WNOTHREAD;
     }
 

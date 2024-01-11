@@ -23,7 +23,7 @@ Pre-requisite knowledge
 Gramine is a Library OS that emulates the Linux kernel. Think of Gramine as a
 tiny Linux re-implementation in userspace. As one example, Gramine has its own
 implementations of Linux system calls. As another example, Gramine implements
-its own ``/proc/`` file system.
+its own ``/proc/`` filesystem.
 
 Moreover, Gramine with the Intel SGX backend also emulates/validates some CPU
 features. For example, Gramine with SGX verifies the return values of the CPUID
@@ -75,7 +75,7 @@ programming. We recommend the following books and resources:
 
 To meaningfully contribute to Gramine, the developer is expected to have a
 decent level of understanding of the concepts involved in any given subsystem of
-Gramine. For example, to contribute a patch/feature to Gramine's file system
+Gramine. For example, to contribute a patch/feature to Gramine's filesystem
 implementation, the developer is expected to have the Linux/Unix specific
 knowledge of dentries, inodes, mount points.
 
@@ -261,13 +261,11 @@ fine on native Linux but fails under Gramine::
      Try to identify the system call in Gramine that goes wrong (e.g., returns
      an error code whereas it was supposed to finish successfully).
 
-   - Analyze the manifest file carefully. If at least one of the binaries
-     spawned during app execution is non-PIE, then set ``sgx.nonpie_binary =
-     true``. If you suspect problems with environment variables, see if it works
-     with ``loader.insecure__use_host_env = true``. If you observe that memory
-     addresses change constantly and hinder your debugging, set
-     ``loader.insecure__disable_aslr = true``. But don't use the last two
-     options in production; use them only for debugging and analysis!
+   - Analyze the manifest file carefully. If you suspect problems with
+     environment variables, see if it works with ``loader.insecure__use_host_env
+     = true``. If you observe that memory addresses change constantly and hinder
+     your debugging, set ``loader.insecure__disable_aslr = true``. But don't use
+     these two options in production; use them only for debugging and analysis!
 
    - Analyze FS mount points (``fs.mounts``) in the manifest file carefully.
      Check for duplicate mount points -- remember that a duplicate mount point's
@@ -600,7 +598,7 @@ system call that is not implemented in Gramine (recall that ``-38`` is the
      functions, components of Gramine are required to implement the system call?
      For example, the ``read`` syscall is very generic: it applies to regular
      files, pipes, sockets, eventfd, etc. So the ``read`` syscall touches almost
-     all components and file systems of Gramine.
+     all components and filesystems of Gramine.
 
 #. Discuss the system call and your proposed implementation with Gramine
    maintainers. Do **not** try to implement the system call immediately. You

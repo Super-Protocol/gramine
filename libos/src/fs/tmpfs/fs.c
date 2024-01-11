@@ -14,12 +14,11 @@
  * the `data` field of the inode (as a pointer to `struct libos_mem_file`).
  */
 
-#include <errno.h>
-
 #include "libos_fs.h"
 #include "libos_handle.h"
 #include "libos_lock.h"
 #include "libos_vma.h"
+#include "linux_abi/errors.h"
 #include "perm.h"
 #include "stat.h"
 
@@ -211,6 +210,12 @@ static int tmpfs_chmod(struct libos_dentry* dent, mode_t perm) {
     return 0;
 }
 
+static int tmpfs_fchmod(struct libos_handle* hdl, mode_t perm) {
+    __UNUSED(hdl);
+    __UNUSED(perm);
+    return 0;
+}
+
 static ssize_t tmpfs_read(struct libos_handle* hdl, void* buf, size_t size, file_off_t* pos) {
     ssize_t ret;
 
@@ -254,8 +259,10 @@ static ssize_t tmpfs_write(struct libos_handle* hdl, const void* buf, size_t siz
     struct libos_mem_file* mem = inode->data;
 
     ret = mem_file_write(mem, *pos, buf, size);
-    if (ret < 0)
-        goto out;
+    if (ret < 0) {
+        unlock(&inode->lock);
+        return ret;
+    }
 
     inode->size = mem->size;
 
@@ -263,8 +270,17 @@ static ssize_t tmpfs_write(struct libos_handle* hdl, const void* buf, size_t siz
     inode->mtime = time_us / USEC_IN_SEC;
     /* keep `ret` */
 
-out:
     unlock(&inode->lock);
+
+    /* If there are any MAP_SHARED mappings for the file, this will read data from `hdl`. */
+    if (__atomic_load_n(&hdl->inode->num_mmapped, __ATOMIC_ACQUIRE) != 0) {
+        int reload_ret = reload_mmaped_from_file_handle(hdl);
+        if (reload_ret < 0) {
+            log_error("reload mmapped regions of file failed: %s", unix_strerror(reload_ret));
+            BUG();
+        }
+    }
+
     return ret;
 }
 
@@ -302,6 +318,7 @@ struct libos_fs_ops tmp_fs_ops = {
     .poll     = &generic_inode_poll,
     .mmap     = &generic_emulated_mmap,
     .msync    = &generic_emulated_msync,
+    .fchmod   = &tmpfs_fchmod,
 };
 
 struct libos_d_ops tmp_d_ops = {

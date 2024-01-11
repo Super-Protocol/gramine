@@ -4,19 +4,21 @@
  *                    Borys Popławski <borysp@invisiblethingslab.com>
  */
 
-#include <errno.h>
-#include <linux/sched.h>
-
 #include "libos_checkpoint.h"
 #include "libos_fs.h"
 #include "libos_internal.h"
 #include "libos_ipc.h"
 #include "libos_lock.h"
+#include "libos_rwlock.h"
 #include "libos_table.h"
 #include "libos_thread.h"
 #include "libos_types.h"
 #include "libos_vma.h"
+#include "linux_abi/errors.h"
+#include "linux_abi/process.h"
+#include "linux_abi/sched.h"
 #include "pal.h"
+#include "toml_utils.h"
 
 struct libos_clone_args {
     PAL_HANDLE create_event;
@@ -162,15 +164,18 @@ static long do_clone_new_vm(IDTYPE child_vmid, unsigned long flags, struct libos
     }
 
     lock(&g_process.fs_lock);
+    rwlock_read_lock(&g_process_id_lock);
     struct libos_process process_description = {
         .pid = thread->tid,
         .ppid = g_process.pid,
-        .pgid = __atomic_load_n(&g_process.pgid, __ATOMIC_ACQUIRE),
+        .pgid = g_process.pgid,
+        .sid = g_process.sid,
         .root = g_process.root,
         .cwd = g_process.cwd,
         .umask = g_process.umask,
         .exec = g_process.exec,
     };
+    rwlock_read_unlock(&g_process_id_lock);
 
     get_dentry(process_description.root);
     get_dentry(process_description.cwd);
@@ -292,8 +297,8 @@ long libos_syscall_clone(unsigned long flags, unsigned long user_stack_addr, int
 
     int* set_parent_tid = NULL;
     if (flags & CLONE_PARENT_SETTID) {
-        if (!parent_tidptr)
-            return -EINVAL;
+        if (!is_user_memory_writable(parent_tidptr, sizeof(*parent_tidptr)))
+            return -EFAULT;
         set_parent_tid = parent_tidptr;
     }
 
@@ -307,15 +312,33 @@ long libos_syscall_clone(unsigned long flags, unsigned long user_stack_addr, int
 
     long ret = 0;
 
+    if (clone_new_process) {
+        assert(g_manifest_root);
+        bool disallow_subprocesses;
+        ret = toml_bool_in(g_manifest_root, "sys.disallow_subprocesses", /*defaultval=*/false,
+                           &disallow_subprocesses);
+        if (ret < 0) {
+            log_error("Cannot parse \'sys.disallow_subprocesses\' (the value must be `true` or "
+                      "`false`)");
+            return -ENOSYS;
+        }
+        if (disallow_subprocesses) {
+            if (FIRST_TIME()) {
+                log_warning("The app tried to create a subprocess, but this is disabled "
+                            "(sys.disallow_subprocesses = true)");
+            }
+            return -EAGAIN;
+        }
+    }
+
     struct libos_thread* thread = get_new_thread();
     if (!thread) {
-        ret = -ENOMEM;
-        goto failed;
+        return -ENOMEM;
     }
 
     if (flags & CLONE_CHILD_SETTID) {
-        if (!child_tidptr) {
-            ret = -EINVAL;
+        if (!is_user_memory_writable(child_tidptr, sizeof(*child_tidptr))) {
+            ret = -EFAULT;
             goto failed;
         }
         thread->set_child_tid = child_tidptr;
@@ -451,8 +474,8 @@ long libos_syscall_clone(unsigned long flags, unsigned long user_stack_addr, int
     while (!__atomic_load_n(&new_args.is_thread_initialized, __ATOMIC_ACQUIRE)) {
         CPU_RELAX();
     }
-    PalObjectClose(new_args.initialize_event);
-    PalObjectClose(new_args.create_event);
+    PalObjectDestroy(new_args.initialize_event);
+    PalObjectDestroy(new_args.create_event);
 
     put_thread(thread);
     return tid;
@@ -461,11 +484,10 @@ clone_thread_failed:
     if (new_args.thread)
         put_thread(new_args.thread);
     if (new_args.create_event)
-        PalObjectClose(new_args.create_event);
+        PalObjectDestroy(new_args.create_event);
     if (new_args.initialize_event)
-        PalObjectClose(new_args.initialize_event);
+        PalObjectDestroy(new_args.initialize_event);
 failed:
-    if (thread)
-        put_thread(thread);
+    put_thread(thread);
     return ret;
 }

@@ -13,6 +13,23 @@
 #include "libos_fs.h"
 #include "libos_fs_pseudo.h"
 
+#define DEFAULT_KERNEL_MAX_CPUS 8192
+static uint32_t g_kernel_max_cpus = DEFAULT_KERNEL_MAX_CPUS;
+
+static int sys_cpu_kernel_max(struct libos_dentry* dent, char** out_data, size_t* out_size) {
+    __UNUSED(dent);
+    char str[32];
+
+    /* `- 1` because Linux always reports kernel_max like this */
+    int ret = snprintf(str, sizeof(str), "%u\n", g_kernel_max_cpus - 1);
+    if (ret < 0)
+        return ret;
+    if ((size_t)ret >= sizeof(str))
+        return -ERANGE;
+
+    return sys_load(str, out_data, out_size);
+}
+
 int sys_print_as_ranges(char* buf, size_t buf_size, size_t count,
                         bool (*is_present)(size_t ind, const void* arg), const void* callback_arg) {
     size_t buf_pos = 0;
@@ -168,6 +185,9 @@ bool sys_resource_name_exists(struct libos_dentry* parent, const char* name) {
     if (pseudo_parse_ulong(&name[prefix_len], total - 1, &n) < 0)
         return false;
 
+    if (!strcmp(parent->name, "node") && !g_pal_public_state->topo_info.numa_nodes[n].is_online)
+        return false;
+
     return true;
 }
 
@@ -181,6 +201,9 @@ int sys_resource_list_names(struct libos_dentry* parent, readdir_callback_t call
     /* Generate "{prefix}N" names for all N less than total */
 
     for (size_t i = 0; i < total; i++) {
+        if (!strcmp(parent->name, "node") && !g_pal_public_state->topo_info.numa_nodes[i].is_online)
+            continue;
+
         char ent_name[strlen(prefix) + 22];
         snprintf(ent_name, sizeof(ent_name), "%s%zu", prefix, i);
         int ret = callback(ent_name, arg);
@@ -206,8 +229,21 @@ int sys_load(const char* str, char** out_data, size_t* out_size) {
 }
 
 static void init_cpu_dir(struct pseudo_node* cpu) {
+    uint32_t next_power_of_2 = DEFAULT_KERNEL_MAX_CPUS;
+    assert(IS_POWER_OF_2(next_power_of_2));
+
+    while (next_power_of_2 < g_pal_public_state->topo_info.threads_cnt) {
+        /* this should never happen in real systems, so BUG() railguard is enough */
+        if (__builtin_mul_overflow(next_power_of_2, 2, &next_power_of_2))
+            BUG();
+    }
+    g_kernel_max_cpus = next_power_of_2;
+
+    pseudo_add_str(cpu, "kernel_max", &sys_cpu_kernel_max);
     pseudo_add_str(cpu, "online", &sys_cpu_general_load);
+    pseudo_add_str(cpu, "offline", &sys_cpu_general_load);
     pseudo_add_str(cpu, "possible", &sys_cpu_general_load);
+    pseudo_add_str(cpu, "present", &sys_cpu_general_load);
 
     struct pseudo_node* cpuX = pseudo_add_dir(cpu, NULL);
     cpuX->name_exists = &sys_resource_name_exists;
@@ -253,8 +289,6 @@ static void init_node_dir(struct pseudo_node* node) {
     pseudo_add_str(nodeX, "distance", &sys_node_load);
     pseudo_add_str(nodeX, "meminfo", &sys_node_meminfo_load);
 
-    // TODO(mkow): Does this show up for offline nodes? I never succeeded in shutting down one, even
-    // after shutting down all CPUs inside the node it shows up as online on `node/online` list.
     struct pseudo_node* hugepages = pseudo_add_dir(nodeX, "hugepages");
     struct pseudo_node* hugepages_2m = pseudo_add_dir(hugepages, "hugepages-2048kB");
     pseudo_add_str(hugepages_2m, "nr_hugepages", &sys_node_load);

@@ -472,8 +472,6 @@ static void dump_dentry(struct libos_dentry* dent, unsigned int level) {
     }
 }
 
-#undef DUMP_FLAG
-
 void dump_dcache(struct libos_dentry* dent) {
     lock(&g_dcache_lock);
 
@@ -534,8 +532,8 @@ BEGIN_CP_FUNC(dentry) {
         INIT_LIST_HEAD(new_dent, siblings);
         refcount_set(&new_dent->ref_count, 0);
 
-        /* `fs_lock` is used only by process leader. */
-        new_dent->fs_lock = NULL;
+        /* `file_locks` is used only by process leader. */
+        new_dent->file_locks = NULL;
 
         DO_CP_MEMBER(str, dent, new_dent, name);
 

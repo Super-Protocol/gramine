@@ -13,6 +13,7 @@
 #include "libos_ipc.h"
 #include "libos_process.h"
 #include "libos_thread.h"
+#include "linux_abi/errors.h"
 #include "pal.h"
 
 #define __attribute_migratable __attribute__((section(".migratable")))
@@ -112,7 +113,7 @@ struct libos_cp_store {
 typedef int (*cp_func)(CP_FUNC_ARGS);
 typedef int (*rs_func)(RS_FUNC_ARGS);
 
-extern const char* __cp_name;
+extern const char* const __cp_name;
 extern const cp_func __cp_func; // TODO: This should be declared as an array of unspecified size.
 extern const rs_func __rs_func[];
 
@@ -215,7 +216,7 @@ enum {
     })
 
 #define BEGIN_CP_FUNC(name)                                                                \
-    const char* cp_name_##name __attribute__((section(".cp_name." #name))) = #name;        \
+    const char* const cp_name_##name __attribute__((section(".cp_name." #name))) = #name;  \
     extern DEFINE_CP_FUNC(name);                                                           \
     extern DEFINE_RS_FUNC(name);                                                           \
     const cp_func cp_func_##name __attribute__((section(".cp_func." #name))) = &cp_##name; \

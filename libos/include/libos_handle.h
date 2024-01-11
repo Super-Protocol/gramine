@@ -7,8 +7,6 @@
 
 #pragma once
 
-#include <asm/fcntl.h>
-#include <asm/resource.h>
 #include <stdalign.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -18,8 +16,10 @@
 #include "libos_lock.h"
 #include "libos_pollable_event.h"
 #include "libos_refcount.h"
+#include "libos_rwlock.h"
 #include "libos_sync.h"
 #include "libos_types.h"
+#include "linux_abi/limits.h"
 #include "linux_socket.h"
 #include "list.h"
 #include "pal.h"
@@ -37,6 +37,7 @@ enum libos_handle_type {
     TYPE_TMPFS,      /* string-based files (with data inside dentry), used by `tmpfs` filesystem */
     TYPE_SYNTHETIC,  /* synthetic files, used by `synthetic` filesystem */
     TYPE_PATH,       /* path to a file (the file is not actually opened) */
+    TYPE_SHM,        /* shared files, used by `shm` filesystem */
 
     /* Pipes and sockets: */
     TYPE_PIPE,       /* pipes, used by `pipe` filesystem */
@@ -47,21 +48,6 @@ enum libos_handle_type {
     TYPE_EVENTFD,    /* eventfd handles, used by `eventfd` filesystem */
 };
 
-struct libos_handle;
-struct libos_thread;
-struct libos_vma;
-
-enum libos_file_type {
-    FILE_UNKNOWN,
-    FILE_REGULAR,
-    FILE_DIR,
-    FILE_DEV,
-    FILE_TTY,
-};
-
-#define FILE_HANDLE_DATA(hdl)  ((hdl)->info.file.data)
-#define FILE_DENTRY_DATA(dent) ((struct libos_file_data*)(dent)->data)
-
 struct libos_pipe_handle {
     bool ready_for_ops; /* true for pipes, false for FIFOs that were mknod'ed but not open'ed */
     char name[PIPE_URI_SIZE];
@@ -70,6 +56,7 @@ struct libos_pipe_handle {
 enum libos_sock_state {
     SOCK_NEW,
     SOCK_BOUND,
+    SOCK_CONNECTING,
     SOCK_CONNECTED,
     SOCK_LISTENING,
 };
@@ -83,7 +70,7 @@ enum libos_sock_state {
  * stream reads (see the comment in `do_recvmsg` in "libos/src/sys/libos_socket.c").
  * Access to `force_nonblocking_users_count` is protected by the lock of the handle wrapping this
  * struct.
- * `pal_handle` should be accessed using atomic operations.
+ * `pal_handle` and `connecting_in_progress` should be accessed using atomic operations.
  * If you need to take both `recv_lock` and `lock`, take the former first.
  */
 struct libos_sock_handle {
@@ -112,6 +99,8 @@ struct libos_sock_handle {
     uint64_t sendtimeout_us;
     uint64_t receivetimeout_us;
     unsigned int last_error;
+    /* This field is an atomically-accessed version of the SOCK_CONNECTING state (for perf). */
+    bool connecting_in_progress;
     /* This field denotes whether the socket was ever bound. */
     bool was_bound;
     /* This field indicates if the socket is ready for read-like operations (`recv`/`read` or
@@ -145,12 +134,25 @@ struct libos_epoll_handle {
     size_t last_returned_index;
 };
 
-struct libos_fs;
-struct libos_dentry;
-
 struct libos_handle {
     enum libos_handle_type type;
     bool is_dir;
+
+    /* Unique ID. This field does not change, so reading it does not require holding any locks.
+     * Currently used only for `flock` system call. */
+    uint64_t id;
+    /*
+     * Specifies whether this handle was created by this process or inherited from the parent
+     * process. Used to perform an operation on the handle only once per Gramine instance (with
+     * multiple processes). Currently used to perform LOCK_UN operation in `flock` system call when
+     * the "last" file descriptor to this handle is closed (by "last" FD we assume here the last FD
+     * referring to this handle in the creator process).
+     *
+     * FIXME: Problematic case: P1 opens a handle, spawns P2 and terminates; in this case the
+     *        operation (e.g. LOCK_UN) would be performed even though the handle is still opened in
+     *        P2. Unfortunately, Gramine lacks system-wide tracking of handle FDs.
+     */
+    bool created_by_process;
 
     refcount_t ref_count;
 
@@ -242,7 +244,7 @@ struct libos_handle_map {
 
     /* refrence count and lock */
     refcount_t ref_count;
-    struct libos_lock lock;
+    struct libos_rwlock lock;
 
     /* An array of file descriptor belong to this mapping */
     struct libos_fd_handle** map;
@@ -270,8 +272,6 @@ int set_new_fd_handle_by_fd(uint32_t fd, struct libos_handle* hdl, int fd_flags,
                             struct libos_handle_map* map);
 int set_new_fd_handle_above_fd(uint32_t fd, struct libos_handle* hdl, int fd_flags,
                                struct libos_handle_map* map);
-struct libos_handle* __detach_fd_handle(struct libos_fd_handle* fd, int* flags,
-                                        struct libos_handle_map* map);
 struct libos_handle* detach_fd_handle(uint32_t fd, int* flags, struct libos_handle_map* map);
 void detach_all_fds(void);
 void close_cloexec_handles(struct libos_handle_map* map);
@@ -280,8 +280,6 @@ void close_cloexec_handles(struct libos_handle_map* map);
 int dup_handle_map(struct libos_handle_map** new_map, struct libos_handle_map* old_map);
 void get_handle_map(struct libos_handle_map* map);
 void put_handle_map(struct libos_handle_map* map);
-int walk_handle_map(int (*callback)(struct libos_fd_handle*, struct libos_handle_map*),
-                    struct libos_handle_map* map);
 
 int init_handle(void);
 int init_std_handles(void);

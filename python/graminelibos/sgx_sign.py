@@ -6,24 +6,28 @@
 #                    Wojtek Porczyk <woju@invisiblethingslab.com>
 #
 
+import functools
 import hashlib
 import os
 import pathlib
 import struct
-import subprocess
+
+import click
 
 from cryptography.hazmat import backends
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 import elftools.elf.elffile
 
 from . import _CONFIG_PKGLIBDIR
-from . import _offsets as offs # pylint: disable=import-error,no-name-in-module
 from .manifest import Manifest
 from .sigstruct import Sigstruct
 
+import _graminelibos_offsets as offs # pylint: disable=import-error,wrong-import-order
 
+# TODO after deprecating 20.04: remove backend wrt
+# https://cryptography.io/en/latest/faq/#what-happened-to-the-backend-argument
 _cryptography_backend = backends.default_backend()
 
 # Default / Architectural Options
@@ -73,36 +77,78 @@ def parse_size(value):
 def collect_bits(manifest_sgx, options_dict):
     val = 0
     for opt, bits in options_dict.items():
-        if manifest_sgx[opt] == 1:
+        if manifest_sgx.get(opt) is True:
             val |= bits
     return val
+
+
+def collect_cpu_feature_bits(manifest_cpu_features, options_dict, val, mask, security_hardening):
+    for opt, bits in options_dict.items():
+        if opt not in manifest_cpu_features:
+            continue
+        if manifest_cpu_features[opt] == "required":
+            val |= bits
+            mask |= bits
+        elif manifest_cpu_features[opt] == "disabled":
+            val &= ~bits
+            mask |= bits
+        elif security_hardening or manifest_cpu_features[opt] != "unspecified":
+            raise KeyError(f'Manifest option `sgx.cpu_features.{opt}` has a disallowed value')
+    return val, mask
 
 
 def get_enclave_attributes(manifest_sgx):
     flags_dict = {
         'debug': offs.SGX_FLAGS_DEBUG,
     }
+    flags = collect_bits(manifest_sgx, flags_dict)
+    if ARCHITECTURE == 'amd64':
+        flags |= offs.SGX_FLAGS_MODE64BIT
 
-    xfrms_dict = {
+    # TODO: 'require_exinfo' was deprecated in release v1.6, should be removed in v1.7
+    if 'require_exinfo' in manifest_sgx:
+        if 'use_exinfo' in manifest_sgx:
+            raise KeyError(f'`sgx.require_exinfo` cannot coexist with `sgx.use_exinfo`')
+        manifest_sgx['use_exinfo'] = manifest_sgx.pop('require_exinfo')
+
+    miscs_dict = {
+        'use_exinfo': offs.SGX_MISCSELECT_EXINFO,
+    }
+    miscs = collect_bits(manifest_sgx, miscs_dict)
+
+    # TODO: these were deprecated in release v1.6, so they should be removed in v1.7
+    deprecated_xfrms_dict = {
         'require_avx': offs.SGX_XFRM_AVX,
         'require_avx512': offs.SGX_XFRM_AVX512,
         'require_mpx': offs.SGX_XFRM_MPX,
         'require_pkru': offs.SGX_XFRM_PKRU,
         'require_amx': offs.SGX_XFRM_AMX,
     }
-
-    miscs_dict = {
-        'require_exinfo': offs.SGX_MISCSELECT_EXINFO,
+    xfrms_dict = {
+        'avx': offs.SGX_XFRM_AVX,
+        'avx512': offs.SGX_XFRM_AVX512,
+        'amx': offs.SGX_XFRM_AMX,
+    }
+    secure_xfrms_dict = {
+        'mpx': offs.SGX_XFRM_MPX,
+        'pkru': offs.SGX_XFRM_PKRU,
     }
 
-    flags = collect_bits(manifest_sgx, flags_dict)
-    if ARCHITECTURE == 'amd64':
-        flags |= offs.SGX_FLAGS_MODE64BIT
+    xfrms, xfrms_mask = offs.SGX_XFRM_LEGACY, offs.SGX_XFRM_MASK_CONST
+    if manifest_sgx.get('cpu_features') is None:
+        # collect deprecated `sgx.require_xxx` options; remove this in v1.7
+        xfrms |= collect_bits(manifest_sgx, deprecated_xfrms_dict)
+    else:
+        for deprecated_key in deprecated_xfrms_dict:
+            if deprecated_key in manifest_sgx:
+                raise KeyError(f'`sgx.cpu_features` cannot coexist with `sgx.{deprecated_key}`')
+        xfrms, xfrms_mask = collect_cpu_feature_bits(manifest_sgx['cpu_features'], xfrms_dict,
+                                                     xfrms, xfrms_mask, security_hardening=False)
+        xfrms, xfrms_mask = collect_cpu_feature_bits(manifest_sgx['cpu_features'],
+                                                     secure_xfrms_dict, xfrms, xfrms_mask,
+                                                     security_hardening=True)
 
-    xfrms = offs.SGX_XFRM_LEGACY | collect_bits(manifest_sgx, xfrms_dict)
-    miscs = collect_bits(manifest_sgx, miscs_dict)
-
-    return flags, xfrms, miscs
+    return flags, miscs, xfrms, xfrms_mask
 
 
 # Populate Enclave Memory
@@ -447,22 +493,14 @@ def get_mrenclave_and_manifest(manifest_path, libpal, verbose=False):
     attr = {
         'enclave_size': parse_size(manifest_sgx['enclave_size']),
         'edmm_enable': manifest_sgx.get('edmm_enable', False),
-        'max_threads': manifest_sgx.get('max_threads', manifest_sgx.get('thread_num')),
-        'isv_prod_id': manifest_sgx['isvprodid'],
-        'isv_svn': manifest_sgx['isvsvn'],
+        'max_threads': manifest_sgx['max_threads'],
     }
-    attr['flags'], attr['xfrms'], attr['misc_select'] = get_enclave_attributes(manifest_sgx)
 
     if verbose:
-        print('Attributes:')
+        print('Attributes (required for enclave measurement):')
         print(f'    size:        {attr["enclave_size"]:#x}')
         print(f'    edmm:        {attr["edmm_enable"]}')
         print(f'    max_threads: {attr["max_threads"]}')
-        print(f'    isv_prod_id: {attr["isv_prod_id"]}')
-        print(f'    isv_svn:     {attr["isv_svn"]}')
-        print(f'    attr.flags:  {attr["flags"]:#x}')
-        print(f'    attr.xfrm:   {attr["xfrms"]:#x}')
-        print(f'    misc_select: {attr["misc_select"]:#x}')
 
         print('SGX remote attestation:')
         attestation_type = manifest_sgx.get('remote_attestation', 'none')
@@ -480,12 +518,8 @@ def get_mrenclave_and_manifest(manifest_path, libpal, verbose=False):
     # Populate memory areas
     memory_areas = get_memory_areas(attr, libpal)
 
-    if manifest_sgx['nonpie_binary']:
-        enclave_base = offs.DEFAULT_ENCLAVE_BASE
-        enclave_heap_min = offs.MMAP_MIN_ADDR
-    else:
-        enclave_base = attr['enclave_size']
-        enclave_heap_min = enclave_base
+    enclave_base = offs.DEFAULT_ENCLAVE_BASE
+    enclave_heap_min = offs.MMAP_MIN_ADDR
 
     manifest_data += b'\0' # in-memory manifest needs NULL-termination
 
@@ -535,16 +569,66 @@ def get_tbssigstruct(manifest_path, date, libpal=SGX_LIBPAL, verbose=False):
     sig['isv_prod_id'] = manifest_sgx['isvprodid']
     sig['isv_svn'] = manifest_sgx['isvsvn']
 
-    attribute_flags, attribute_xfrms, misc_select = get_enclave_attributes(manifest_sgx)
+    attribute_flags, misc_select, attribute_xfrms, xfrms_mask = get_enclave_attributes(manifest_sgx)
     sig['attribute_flags'] = attribute_flags
-    sig['attribute_xfrms'] = attribute_xfrms
     sig['misc_select'] = misc_select
+    sig['attribute_xfrms'] = attribute_xfrms
+    sig['attribute_xfrm_mask'] = xfrms_mask
 
     return sig
 
 
-def sign_with_local_key(data, key):
-    """Signs *data* using *key*.
+@click.command(add_help_option=False)
+@click.pass_context
+@click.help_option('--help-file')
+@click.option('--key', '-k', metavar='FILE',
+    type=click.File('rb'),
+    default=os.fspath(SGX_RSA_KEY_PATH),
+    help='specify signing key (.pem) file')
+# Explicit 'passphrase' below is for compatibility with click < 6.8 (supported on .el8),
+# see https://github.com/pallets/click/issues/793 for more info.
+# TODO after deprecating .el8: remove this workaround
+@click.option('--passphrase', '--password', '-p', 'passphrase', metavar='PASSPHRASE',
+    help='optional passphrase to decrypt the key')
+def sign_with_file(ctx, key, passphrase):
+    if passphrase is not None:
+        passphrase = passphrase.encode()
+    try:
+        private_key = load_private_key_from_pem_file(key, passphrase)
+    except InvalidKeyError as e:
+        ctx.fail(str(e))
+
+    return functools.partial(sign_with_private_key, private_key=private_key), [key.name]
+
+
+class InvalidKeyError(Exception):
+    pass
+
+
+def load_private_key_from_pem_file(file, passphrase=None):
+    with file:
+        private_key = serialization.load_pem_private_key(
+            file.read(), password=passphrase, backend=_cryptography_backend)
+
+    if not isinstance(private_key, rsa.RSAPrivateKey):
+        raise InvalidKeyError(
+            f'Invalid key: expected RSA private key, found {type(private_key).__name__} instance')
+
+    if private_key.key_size != SGX_RSA_KEY_SIZE:
+        raise InvalidKeyError(
+            f'Invalid RSA key: expected key size {SGX_RSA_KEY_SIZE}, got {private_key.key_size}')
+
+    exponent = private_key.public_key().public_numbers().e
+
+    if exponent != SGX_RSA_PUBLIC_EXPONENT:
+        raise InvalidKeyError(
+            f'Invalid RSA key: expected exponent {SGX_RSA_PUBLIC_EXPONENT}, got {exponent}')
+
+    return private_key
+
+
+def sign_with_private_key(data, private_key):
+    """Signs *data* using *private_key*.
 
     Function used to generate an RSA signature over provided data using a 3072-bit private key with
     the public exponent of 3 (hard Intel SGX requirement on the key size and the exponent).
@@ -552,31 +636,98 @@ def sign_with_local_key(data, key):
 
     Args:
         data (bytes): Data to calculate the signature over.
-        key (str): Path to a file with RSA private key.
+        private_key (cryptography.hazmat.primitives.asymmetric.rsa.RSAPrivateKey): RSA private key.
 
     Returns:
         (int, int, int): Tuple of exponent, modulus and signature respectively.
+
+    See Also:
+        :func:`sign_with_private_key_from_pem_file`
+            This function also signs *data*, but the key argument is an already
+            opened file.
+        :func:`sign_with_private_key_from_pem_path`
+            This function also signs *data*, but the key argument is path to a file, not a file-like
+            object.
     """
-    proc = subprocess.Popen(
-        ['openssl', 'rsa', '-modulus', '-in', key, '-noout'],
-        stdout=subprocess.PIPE)
-    modulus_out, _ = proc.communicate()
-    modulus = bytes.fromhex(modulus_out[8:8+offs.SE_KEY_SIZE*2].decode())
 
-    proc = subprocess.Popen(
-        ['openssl', 'sha256', '-binary', '-sign', key],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-    signature, _ = proc.communicate(data)
+    assert private_key.key_size == SGX_RSA_KEY_SIZE
+    public_numbers = private_key.public_key().public_numbers()
+    assert public_numbers.e == SGX_RSA_PUBLIC_EXPONENT
 
-    exponent_int = 3
-    modulus_int = int.from_bytes(modulus, byteorder='big')
-    signature_int = int.from_bytes(signature, byteorder='big')
+    # SDM vol. 3D pt. 4 38.13, description of SIGNATURE field:
+    #   The (3072-bit integer) SIGNATURE should be an RSA signature, where:
+    #   a) the RSA modulus (MODULUS) is a 3072-bit integer;
+    #   b) the public exponent is set to 3;
+    #   c) the signing procedure uses the EMSA-PKCS1-v1.5 format with DER encoding of the
+    #      “DigestInfo” value as specified in of PKCS#1 v2.1/RFC 3447.
+    # also see IACR 2016/086: section 6.5 and figure 76
+    signature = private_key.sign(data, padding.PKCS1v15(), hashes.SHA256())
 
-    return exponent_int, modulus_int, signature_int
+    return public_numbers.e, public_numbers.n, int.from_bytes(signature, byteorder='big')
+
+
+def sign_with_private_key_from_pem_file(data, file, passphrase=None):
+    """Signs *data* using key loaded from *file*.
+
+    Function used to generate an RSA signature over provided data using a 3072-bit private key with
+    the public exponent of 3 (hard Intel SGX requirement on the key size and the exponent).
+    Suitable to be used as a callback to :py:func:`graminelibos.Sigstruct.sign()`.
+
+    Args:
+        data (bytes): Data to calculate the signature over.
+        file (file-like): File-like object, from which one can read RSA private key.
+        passphrase (bytes or None): Optional passphrase.
+
+    Returns:
+        (int, int, int): Tuple of exponent, modulus and signature respectively.
+
+    See Also:
+        :func:`sign_with_private_key`
+            This function also signs *data*, but the key argument is
+            :class:`cryptography.hazmat.primitives.asymmetric.rsa.RSAPrivateKey` instance.
+        :func:`sign_with_private_key_from_pem_path`
+            This function also signs *data*, but the key argument is path to a file, not a file-like
+            object.
+    """
+    return sign_with_private_key(data, load_private_key_from_pem_file(file, passphrase))
+
+
+def sign_with_private_key_from_pem_path(data, path, passphrase=None):
+    """Signs *data* using key loaded from *path*.
+
+    Function used to generate an RSA signature over provided data using a 3072-bit private key with
+    the public exponent of 3 (hard Intel SGX requirement on the key size and the exponent).
+    Suitable to be used as a callback to :py:func:`graminelibos.Sigstruct.sign()`.
+
+    Args:
+        data (bytes): Data to calculate the signature over.
+        path (path-like): Path to a file with RSA private key.
+        passphrase (bytes or None): Optional passphrase.
+
+    Returns:
+        (int, int, int): Tuple of exponent, modulus and signature respectively.
+
+    See Also:
+        :func:`sign_with_private_key`
+            This function also signs *data*, but the key argument is
+            :class:`cryptography.hazmat.primitives.asymmetric.rsa.RSAPrivateKey` instance.
+        :func:`sign_with_private_key_from_pem_file`
+            This function also signs *data*, but the key argument is an already
+            opened file.
+    """
+
+    with open(path, 'rb') as file:
+        return sign_with_private_key_from_pem_file(data, file, passphrase)
+
+
+# NOTE: the name and argument name of this function is kept for compatibility, *key* is path to
+# a PEM-encoded file, not a key object from cryptography module
+def sign_with_local_key(data, key):
+    return sign_with_private_key_from_pem_path(data, key)
 
 
 def generate_private_key():
-    """Generate RSA key suitable for use with SGX
+    """Generate RSA key suitable for use with SGX.
 
     Returns:
         cryptography.hazmat.primitives.asymmetric.rsa.RSAPrivateKey: private key
@@ -586,8 +737,9 @@ def generate_private_key():
         key_size=SGX_RSA_KEY_SIZE,
         backend=_cryptography_backend)
 
+
 def generate_private_key_pem():
-    """Generate PEM-encoded RSA key suitable for use with SGX
+    """Generate PEM-encoded RSA key suitable for use with SGX.
 
     Returns:
         bytes: PEM-encoded private key

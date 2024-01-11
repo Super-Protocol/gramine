@@ -19,6 +19,9 @@ sgx_inc = [
     ),
 ]
 
+# below headers are SGX-infrastructure generic and required by e.g. RA-TLS libs
+install_headers('sgx_arch.h', 'sgx_attest.h', subdir : 'gramine')
+
 cflags_pal_sgx = [
     cflags_pal_common,
     '-DHOST_TYPE=Linux-SGX',
@@ -40,13 +43,13 @@ pal_sgx_asm_offsets_h = custom_target('asm-offsets.h[pal-sgx]',
     output: 'asm-offsets.h',
 )
 
-pal_sgx_offsets_py = custom_target('_offsets.py',
+pal_sgx_offsets_py = custom_target('_graminelibos_offsets.py',
     command: [pal_sgx_generated_offsets_print, '--py'],
     capture: true,
-    output: '_offsets.py',
+    output: '_graminelibos_offsets.py',
 
     install: true,
-    install_dir: python3_pkgdir,
+    install_dir: python3_platlib,
 )
 
 pal_sgx_map = custom_target('pal.map',
@@ -55,7 +58,7 @@ pal_sgx_map = custom_target('pal.map',
     output: 'pal.map',
 )
 
-pal_sgx_lds = join_paths(meson.current_source_dir(), 'enclave.lds')
+pal_sgx_lds = meson.current_source_dir() / 'enclave.lds'
 
 libpal_sgx = shared_library('pal',
     'common_manifest_sgx_parser.c',
@@ -67,6 +70,7 @@ libpal_sgx = shared_library('pal',
     'enclave_ocalls.c',
     'enclave_platform.c',
     'enclave_xstate.c',
+    'pal_console.c',
     'pal_devices.c',
     'pal_eventfd.c',
     'pal_events.c',
@@ -123,10 +127,11 @@ libpal_sgx = shared_library('pal',
     dependencies: [
         common_dep,
         cryptoadapter_dep,
+        ioctls_dep,
     ],
 
     install: true,
-    install_dir: join_paths(pkglibdir, 'sgx'),
+    install_dir: pkglibdir / 'sgx',
 )
 
 # host (untrusted runtime)
@@ -173,7 +178,7 @@ libpal_sgx_host = executable('loader',
     ],
 
     install: true,
-    install_dir: join_paths(pkglibdir, 'sgx'),
+    install_dir: pkglibdir / 'sgx',
 )
 
 libpal_sgx_dep = declare_dependency(
@@ -189,7 +194,7 @@ if debug
         output: 'libpal.so.map',
 
         install: true,
-        install_dir: join_paths(pkglibdir, 'sgx'),
+        install_dir: pkglibdir / 'sgx',
     )
 
     custom_target('loader.map',
@@ -199,7 +204,7 @@ if debug
         output: 'loader.map',
 
         install: true,
-        install_dir: join_paths(pkglibdir, 'sgx'),
+        install_dir: pkglibdir / 'sgx',
     )
 
     shared_library('sgx_gdb',
@@ -214,12 +219,12 @@ if debug
         ],
 
         install: true,
-        install_dir: join_paths(pkglibdir, 'sgx/gdb_integration'),
+        install_dir: pkglibdir / 'sgx/gdb_integration',
     )
 
     install_data(
         'gdb_integration/gramine_sgx.gdb',
         'gdb_integration/gramine_sgx_gdb.py',
-        install_dir: join_paths(pkglibdir, 'sgx/gdb_integration'),
+        install_dir: pkglibdir / 'sgx/gdb_integration',
     )
 endif

@@ -11,6 +11,7 @@
 #include "libos_fs_pseudo.h"
 #include "libos_lock.h"
 #include "libos_process.h"
+#include "libos_rwlock.h"
 #include "libos_thread.h"
 #include "libos_types.h"
 #include "libos_vma.h"
@@ -236,15 +237,15 @@ bool proc_thread_fd_name_exists(struct libos_dentry* parent, const char* name) {
 
     struct libos_handle_map* handle_map = get_thread_handle_map(NULL);
     assert(handle_map);
-    lock(&handle_map->lock);
+    rwlock_read_lock(&handle_map->lock);
 
     if (fd > handle_map->fd_top || handle_map->map[fd] == NULL ||
             handle_map->map[fd]->handle == NULL) {
-        unlock(&handle_map->lock);
+        rwlock_read_unlock(&handle_map->lock);
         return false;
     }
 
-    unlock(&handle_map->lock);
+    rwlock_read_unlock(&handle_map->lock);
     return true;
 }
 
@@ -253,7 +254,7 @@ int proc_thread_fd_list_names(struct libos_dentry* parent, readdir_callback_t ca
 
     struct libos_handle_map* handle_map = get_thread_handle_map(NULL);
     assert(handle_map);
-    lock(&handle_map->lock);
+    rwlock_read_lock(&handle_map->lock);
 
     int ret = 0;
     for (uint32_t i = 0; i <= handle_map->fd_top; i++)
@@ -264,7 +265,7 @@ int proc_thread_fd_list_names(struct libos_dentry* parent, readdir_callback_t ca
                 break;
         }
 
-    unlock(&handle_map->lock);
+    rwlock_read_unlock(&handle_map->lock);
     return ret;
 }
 
@@ -285,6 +286,7 @@ static char* describe_handle(struct libos_handle* hdl) {
         case TYPE_SOCK:    str = "sock:[?]";    break;
         case TYPE_EPOLL:   str = "epoll:[?]";   break;
         case TYPE_EVENTFD: str = "eventfd:[?]"; break;
+        case TYPE_SHM:     str = "shm:[?]";     break;
         default:           str = "unknown:[?]"; break;
     }
     return strdup(str);
@@ -297,11 +299,11 @@ int proc_thread_fd_follow_link(struct libos_dentry* dent, char** out_target) {
 
     struct libos_handle_map* handle_map = get_thread_handle_map(NULL);
     assert(handle_map);
-    lock(&handle_map->lock);
+    rwlock_read_lock(&handle_map->lock);
 
     if (fd > handle_map->fd_top || handle_map->map[fd] == NULL ||
             handle_map->map[fd]->handle == NULL) {
-        unlock(&handle_map->lock);
+        rwlock_read_unlock(&handle_map->lock);
         return -ENOENT;
     }
 
@@ -317,7 +319,7 @@ int proc_thread_fd_follow_link(struct libos_dentry* dent, char** out_target) {
         ret = *out_target ? 0 : -ENOMEM;
     }
 
-    unlock(&handle_map->lock);
+    rwlock_read_unlock(&handle_map->lock);
 
     return ret;
 }
@@ -466,6 +468,8 @@ int proc_thread_stat_load(struct libos_dentry* dent, char** out_data, size_t* ou
     if (!str)
         return -ENOMEM;
 
+    /* This lock is needed for accessing `pgid` and `sid`. */
+    rwlock_read_lock(&g_process_id_lock);
     struct {
         const char* fmt;
         unsigned long val;
@@ -474,9 +478,9 @@ int proc_thread_stat_load(struct libos_dentry* dent, char** out_data, size_t* ou
         /* ppid */
         { " %d", g_process.ppid },
         /* pgrp */
-        { " %d", __atomic_load_n(&g_process.pgid, __ATOMIC_ACQUIRE) },
+        { " %d", g_process.pgid },
         /* session */
-        { " %d", /*dummy value=*/0 },
+        { " %d", g_process.sid },
         /* tty_nr */
         { " %d", /*dummy value=*/0 },
         /* tpgid */
@@ -580,6 +584,7 @@ int proc_thread_stat_load(struct libos_dentry* dent, char** out_data, size_t* ou
         /* exit_code */
         { " %d\n", /*dummy value=*/0 },
     };
+    rwlock_read_unlock(&g_process_id_lock);
 
     size_t i = 0;
     while (i < ARRAY_SIZE(status)) {

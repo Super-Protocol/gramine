@@ -28,7 +28,6 @@ int init_slab(void);
 
 void* malloc(size_t size);
 void free(void* mem);
-void* malloc_copy(const void* mem, size_t size);
 
 /* ELF binary loading */
 struct link_map;
@@ -48,9 +47,6 @@ int init_r_debug(void);
 void remove_r_debug(void* addr);
 void append_r_debug(const char* uri, void* addr);
 void clean_link_map_list(void);
-
-/* Get the IPC pipe uri associated with `vmid`. */
-int vmid_to_uri(IDTYPE vmid, char* uri, size_t uri_len);
 
 /* create unique files/pipes */
 int create_pipe(char* name, char* uri, size_t size, PAL_HANDLE* hdl, bool use_vmid_for_name);

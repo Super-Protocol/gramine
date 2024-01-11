@@ -5,19 +5,21 @@
  * Implementation of system calls "readv" and "writev".
  */
 
-#include <errno.h>
-
 #include "libos_fs.h"
 #include "libos_handle.h"
 #include "libos_internal.h"
 #include "libos_table.h"
+#include "linux_abi/errors.h"
 
 /* TODO: `readv` and `writev` syscalls below are not correctly atomic if the implementation does not
  * provide `.readv` and `.writev` callbacks and does not use file position (`hdl->pos`). This most
  * notably affects pipes. */
 
 long libos_syscall_readv(unsigned long fd, struct iovec* vec, unsigned long vlen) {
-    if (!is_user_memory_readable(vec, sizeof(*vec) * vlen))
+    size_t arr_size;
+    if (__builtin_mul_overflow(sizeof(*vec), vlen, &arr_size))
+        return -EINVAL;
+    if (!is_user_memory_readable(vec, arr_size))
         return -EINVAL;
 
     for (size_t i = 0; i < vlen; i++) {
@@ -82,7 +84,10 @@ out:
 }
 
 long libos_syscall_writev(unsigned long fd, struct iovec* vec, unsigned long vlen) {
-    if (!is_user_memory_readable(vec, sizeof(*vec) * vlen))
+    size_t arr_size;
+    if (__builtin_mul_overflow(sizeof(*vec), vlen, &arr_size))
+        return -EINVAL;
+    if (!is_user_memory_readable(vec, arr_size))
         return -EINVAL;
 
     for (size_t i = 0; i < vlen; i++) {

@@ -12,9 +12,11 @@
 #include "libos_internal.h"
 #include "libos_lock.h"
 #include "libos_signal.h"
+#include "libos_socket.h"
 #include "libos_table.h"
 #include "libos_thread.h"
 #include "libos_utils.h"
+#include "linux_abi/errors.h"
 #include "pal.h"
 
 typedef unsigned long __fd_mask;
@@ -27,12 +29,12 @@ typedef unsigned long __fd_mask;
 #define __FDS_BITS(set) ((set)->fds_bits)
 #endif
 
-#define __FD_ZERO(set)                                           \
-    do {                                                         \
-        unsigned int i;                                          \
-        fd_set* arr = (set);                                     \
-        for (i = 0; i < sizeof(fd_set) / sizeof(__fd_mask); i++) \
-            __FDS_BITS(arr)[i] = 0;                              \
+#define __FD_ZERO(set)                                                        \
+    do {                                                                      \
+        unsigned int i;                                                       \
+        struct linux_fd_set* arr = (set);                                     \
+        for (i = 0; i < sizeof(struct linux_fd_set) / sizeof(__fd_mask); i++) \
+            __FDS_BITS(arr)[i] = 0;                                           \
     } while (0)
 
 #define __FD_ELT(d)        ((d) / __NFDBITS)
@@ -81,7 +83,7 @@ static long do_poll(struct pollfd* fds, size_t fds_len, uint64_t* timeout_us) {
     size_t ret_events_count = 0;
     struct libos_handle_map* map = get_cur_thread()->handle_map;
 
-    lock(&map->lock);
+    rwlock_read_lock(&map->lock);
 
     /*
      * After each iteration of this loop either:
@@ -110,33 +112,42 @@ static long do_poll(struct pollfd* fds, size_t fds_len, uint64_t* timeout_us) {
             events &= ~(POLLOUT | POLLWRNORM);
         }
 
+        /*
+         * Some handles (e.g. pipes) do not implement a poll callback at all. In such case we let
+         * PAL do the actual polling.
+         *
+         * Some handles (e.g. files) do have their own, handle-specific poll callback. In such case
+         * we do not add these handles for PAL polling, but instead populate `revents` of a
+         * handle-corresponding FD with the result of the poll callback.
+         *
+         * Finally, some handles (e.g. tty/console) implement a dummy poll callback that returns
+         * "Function not implemented" (-ENOSYS) error. We have this special case because it is
+         * impossible to *not* implement a callback: such handles have two layers of poll
+         * indirection (e.g. tty belongs to the "pseudo" FS which has a generic "pseudo" poll
+         * callback, which calls the actual tty-handle callback).
+         */
+        bool handle_specific_poll_invoked = false;
         if (handle->fs && handle->fs->fs_ops && handle->fs->fs_ops->poll) {
             ret = handle->fs->fs_ops->poll(handle, events, &events);
-            /*
-             * FIXME: remove this hack.
-             * Initial 0,1,2 fds in Gramine are represented by "/dev/tty" (whatever that means)
-             * and have `generic_inode_poll` set as poll callback, which returns `-EAGAIN` on
-             * non-regular-file handles. In such case we let PAL do the actual polling.
-             */
-            if (ret == -EAGAIN && handle->uri && !strcmp(handle->uri, "dev:tty")) {
-                goto dev_tty_hack;
-            }
-
-            if (ret < 0) {
-                unlock(&map->lock);
+            if (ret < 0 && ret != -ENOSYS) {
+                /* ENOSYS implies that no handle-specific poll was found; other errors imply that
+                 * there was a handle-specific poll, but its invocation failed for other reasons */
+                rwlock_read_unlock(&map->lock);
                 goto out;
             }
+            if (ret != -ENOSYS)
+                handle_specific_poll_invoked = true;
+        }
 
+        if (handle_specific_poll_invoked) {
             fds[i].revents = events;
             if (events) {
                 ret_events_count++;
             }
-
-            continue;
-
-            dev_tty_hack:;
+            continue; /* for loop over FDs to poll */
         }
 
+        /* add the handle for PAL polling */
         PAL_HANDLE pal_handle;
         if (handle->type == TYPE_SOCK) {
             pal_handle = __atomic_load_n(&handle->info.sock.pal_handle, __ATOMIC_ACQUIRE);
@@ -165,7 +176,7 @@ static long do_poll(struct pollfd* fds, size_t fds_len, uint64_t* timeout_us) {
         pal_handles[i] = pal_handle;
     }
 
-    unlock(&map->lock);
+    rwlock_read_unlock(&map->lock);
 
     uint64_t tmp_timeout_us = 0;
     if (ret_events_count) {
@@ -191,11 +202,22 @@ static long do_poll(struct pollfd* fds, size_t fds_len, uint64_t* timeout_us) {
 
         fds[i].revents = 0;
         if (ret_events[i] & PAL_WAIT_ERROR)
-            fds[i].revents |= POLLERR | POLLHUP;
+            fds[i].revents |= POLLERR;
+        if (ret_events[i] & PAL_WAIT_HANG_UP) {
+            fds[i].revents |= POLLHUP;
+            /* add RDHUP event only if user requested for it to be reported */
+            fds[i].revents |= fds[i].events & POLLRDHUP;
+        }
         if (ret_events[i] & PAL_WAIT_READ)
             fds[i].revents |= fds[i].events & (POLLIN | POLLRDNORM);
         if (ret_events[i] & PAL_WAIT_WRITE)
             fds[i].revents |= fds[i].events & (POLLOUT | POLLWRNORM);
+
+        if (libos_handles[i]->type == TYPE_SOCK &&
+                (ret_events[i] & (PAL_WAIT_READ | PAL_WAIT_WRITE))) {
+            bool error_event = !!(ret_events[i] & (PAL_WAIT_ERROR | PAL_WAIT_HANG_UP));
+            check_connect_inprogress_on_poll(libos_handles[i], error_event);
+        }
 
         if (fds[i].revents)
             ret_events_count++;
@@ -269,8 +291,8 @@ long libos_syscall_ppoll(struct pollfd* fds, unsigned int nfds, struct timespec*
     return ret;
 }
 
-static long do_select(int nfds, fd_set* read_set, fd_set* write_set, fd_set* except_set,
-                      uint64_t* timeout_us) {
+static long do_select(int nfds, struct linux_fd_set* read_set, struct linux_fd_set* write_set,
+                      struct linux_fd_set* except_set, uint64_t* timeout_us) {
     size_t total_fds = 0;
     for (size_t i = 0; i < (size_t)nfds; i++) {
         if ((read_set && __FD_ISSET(i, read_set)) || (write_set && __FD_ISSET(i, write_set))
@@ -359,18 +381,20 @@ out:
     return ret;
 }
 
-long libos_syscall_select(int nfds, fd_set* read_set, fd_set* write_set, fd_set* except_set,
-                          struct __kernel_timeval* tv) {
-    if (nfds < 0 || (uint64_t)nfds > get_rlimit_cur(RLIMIT_NOFILE) || nfds > INT_MAX)
+long libos_syscall_select(int nfds, struct linux_fd_set* read_set, struct linux_fd_set* write_set,
+                          struct linux_fd_set* except_set, struct __kernel_timeval* tv) {
+    if (nfds < 0 || (uint64_t)nfds > get_rlimit_cur(RLIMIT_NOFILE))
         return -EINVAL;
 
-    /* Each of `read_set`, `write_set` and `except_set` is an array of fd_set items; each fd_set
-     * item has a single inline array `fd_set::fds_bits` of constant size (typically 128B, which
-     * allows to accommodate 1024 bits, i.e. 1024 file descriptors). Therefore we calculate how many
-     * fd_set items are required to accommodate `nfds` number of file descriptors, i.e., we
-     * calculate the length of each of `read_set`, `write_set` and `except_set` arrays. */
-    static_assert(sizeof(((fd_set*)0)->fds_bits) == sizeof(fd_set), "unexpected fd_set struct");
-    size_t fd_set_arr_len = UDIV_ROUND_UP(nfds, BITS_IN_TYPE(((fd_set*)0)->fds_bits));
+    /* Each of `read_set`, `write_set` and `except_set` is an array of linux_fd_set items; each
+     * linux_fd_set item has a single inline array `linux_fd_set::fds_bits` of constant size
+     * (typically 128B, which allows to accommodate 1024 bits, i.e. 1024 file descriptors).
+     * Therefore we calculate how many linux_fd_set items are required to accommodate `nfds` number
+     * of file descriptors, i.e., we calculate the length of each of `read_set`, `write_set` and
+     * `except_set` arrays. */
+    static_assert(sizeof(((struct linux_fd_set*)0)->fds_bits) == sizeof(struct linux_fd_set),
+                  "unexpected struct linux_fd_set struct");
+    size_t fd_set_arr_len = UDIV_ROUND_UP(nfds, BITS_IN_TYPE(((struct linux_fd_set*)0)->fds_bits));
     if (read_set && !is_user_memory_writable(read_set, fd_set_arr_len * sizeof(*read_set))) {
             return -EFAULT;
     }
@@ -407,14 +431,16 @@ struct sigset_argpack {
     size_t size;
 };
 
-long libos_syscall_pselect6(int nfds, fd_set* read_set, fd_set* write_set, fd_set* except_set,
-                            struct __kernel_timespec* tsp, void* _sigmask_argpack) {
-    if (nfds < 0 || (uint64_t)nfds > get_rlimit_cur(RLIMIT_NOFILE) || nfds > INT_MAX)
+long libos_syscall_pselect6(int nfds, struct linux_fd_set* read_set, struct linux_fd_set* write_set,
+                            struct linux_fd_set* except_set, struct __kernel_timespec* tsp,
+                            void* _sigmask_argpack) {
+    if (nfds < 0 || (uint64_t)nfds > get_rlimit_cur(RLIMIT_NOFILE))
         return -EINVAL;
 
     /* for explanation on calculations below, see libos_syscall_select() */
-    static_assert(sizeof(((fd_set*)0)->fds_bits) == sizeof(fd_set), "unexpected fd_set struct");
-    size_t fd_set_arr_len = UDIV_ROUND_UP(nfds, BITS_IN_TYPE(((fd_set*)0)->fds_bits));
+    static_assert(sizeof(((struct linux_fd_set*)0)->fds_bits) == sizeof(struct linux_fd_set),
+                  "unexpected linux_fd_set struct");
+    size_t fd_set_arr_len = UDIV_ROUND_UP(nfds, BITS_IN_TYPE(((struct linux_fd_set*)0)->fds_bits));
     if (read_set && !is_user_memory_writable(read_set, fd_set_arr_len * sizeof(*read_set))) {
             return -EFAULT;
     }

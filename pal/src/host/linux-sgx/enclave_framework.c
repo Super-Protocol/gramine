@@ -120,7 +120,7 @@ void* sgx_copy_to_ustack(const void* ptr, size_t size) {
     }
     void* uptr = sgx_alloc_on_ustack(size);
     if (uptr) {
-        memcpy(uptr, ptr, size);
+        sgx_copy_from_enclave_verified(uptr, ptr, size);
     }
     return uptr;
 }
@@ -130,14 +130,25 @@ void sgx_reset_ustack(const void* old_ustack) {
     UPDATE_USTACK(old_ustack);
 }
 
-static void copy_u64s(void* dst, const void* untrusted_src, size_t count) {
-    assert((uintptr_t)untrusted_src % 8 == 0);
+static void copy_u64s(void* dst, const void* src, size_t count) {
     __asm__ volatile (
         "rep movsq\n"
-        : "+D"(dst), "+S"(untrusted_src), "+c"(count)
+        : "+D"(dst), "+S"(src), "+c"(count)
         :
         : "memory", "cc"
     );
+}
+
+static void copy_u64s_from_untrusted(void* dst, const void* untrusted_src, size_t count) {
+    assert((uintptr_t)untrusted_src % 8 == 0);
+
+    copy_u64s(dst, untrusted_src, count);
+}
+
+static void copy_u64s_to_untrusted(void* untrusted_dst, const void* src, size_t count) {
+    assert((uintptr_t)untrusted_dst % 8 == 0);
+
+    copy_u64s(untrusted_dst, src, count);
 }
 
 void sgx_copy_to_enclave_verified(void* ptr, const void* uptr, size_t size) {
@@ -159,7 +170,7 @@ void sgx_copy_to_enclave_verified(void* ptr, const void* uptr, size_t size) {
     if (prefix_misalignment) {
         /* Beginning of the copied range is misaligned. */
         char prefix_val[8] = { 0 };
-        copy_u64s(prefix_val, (char*)uptr - prefix_misalignment, /*count=*/1);
+        copy_u64s_from_untrusted(prefix_val, (char*)uptr - prefix_misalignment, /*count=*/1);
 
         copy_len = MIN(sizeof(prefix_val) - prefix_misalignment, size);
         memcpy(ptr, prefix_val + prefix_misalignment, copy_len);
@@ -176,7 +187,7 @@ void sgx_copy_to_enclave_verified(void* ptr, const void* uptr, size_t size) {
     size_t suffix_misalignment = size & 7;
     copy_len = size - suffix_misalignment;
     assert(copy_len % 8 == 0);
-    copy_u64s(ptr, uptr, copy_len / 8);
+    copy_u64s_from_untrusted(ptr, uptr, copy_len / 8);
     ptr = (char*)ptr + copy_len;
     uptr = (const char*)uptr + copy_len;
     size -= copy_len;
@@ -185,7 +196,7 @@ void sgx_copy_to_enclave_verified(void* ptr, const void* uptr, size_t size) {
     if (suffix_misalignment) {
         /* End of the copied range is misaligned. */
         char suffix_val[8] = { 0 };
-        copy_u64s(suffix_val, uptr, /*count=*/1);
+        copy_u64s_from_untrusted(suffix_val, uptr, /*count=*/1);
         memcpy(ptr, suffix_val, suffix_misalignment);
     }
 }
@@ -201,12 +212,66 @@ bool sgx_copy_to_enclave(void* ptr, size_t maxsize, const void* uptr, size_t usi
     return true;
 }
 
-bool sgx_copy_from_enclave(void* urts_ptr, const void* enclave_ptr, size_t size) {
-    if (!sgx_is_valid_untrusted_ptr(urts_ptr, size, /*alignment=*/1)
-            || !sgx_is_completely_within_enclave(enclave_ptr, size)) {
+void sgx_copy_from_enclave_verified(void* uptr, const void* ptr, size_t size) {
+    assert(sgx_is_completely_within_enclave(ptr, size));
+    assert(sgx_is_valid_untrusted_ptr(uptr, size, /*alignment=*/1));
+
+    if (size == 0) {
+        return;
+    }
+
+    /*
+     * This should be simple `memcpy(uptr, ptr, size)`, but CVE-2022-21166 (INTEL-SA-00615).
+     * To mitigate this issue, all writes to untrusted memory from within the enclave must be done
+     * in 8-byte chunks aligned to 8-bytes boundary. Since x64 allocates memory in pages of
+     * (at least) 0x1000 in size, we can safely 8-align the pointer down and the size up.
+     */
+    size_t copy_len;
+    size_t prefix_misalignment = (uintptr_t)uptr & 7;
+    if (prefix_misalignment) {
+        /* Beginning of the range to copy is misaligned. */
+        char prefix_val[8] = { 0 };
+        copy_len = MIN(sizeof(prefix_val) - prefix_misalignment, size);
+
+        copy_u64s_from_untrusted(prefix_val, (char*)uptr - prefix_misalignment, /*count=*/1);
+        memcpy(prefix_val + prefix_misalignment, ptr, copy_len);
+        copy_u64s_to_untrusted((char*)uptr - prefix_misalignment, prefix_val, /*count=*/1);
+        uptr = (char*)uptr + copy_len;
+        ptr = (const char*)ptr + copy_len;
+        size -= copy_len;
+
+        if (size == 0) {
+            return;
+        }
+    }
+    assert((uintptr_t)uptr % 8 == 0);
+
+    size_t suffix_misalignment = size & 7;
+    copy_len = size - suffix_misalignment;
+    assert(copy_len % 8 == 0);
+    copy_u64s_to_untrusted(uptr, ptr, copy_len / 8);
+    uptr = (char*)uptr + copy_len;
+    ptr = (const char*)ptr + copy_len;
+    size -= copy_len;
+
+    assert(size == suffix_misalignment);
+    if (suffix_misalignment) {
+        /* End of the range to copy is misaligned. */
+        char suffix_val[8] = { 0 };
+
+        copy_u64s_from_untrusted(suffix_val, uptr, /*count=*/1);
+        memcpy(suffix_val, ptr, suffix_misalignment);
+        copy_u64s_to_untrusted(uptr, suffix_val, 1);
+    }
+}
+
+bool sgx_copy_from_enclave(void* uptr, const void* ptr, size_t size) {
+    if (!sgx_is_valid_untrusted_ptr(uptr, size, /*alignment=*/1)
+            || !sgx_is_completely_within_enclave(ptr, size)) {
         return false;
     }
-    memcpy(urts_ptr, enclave_ptr, size);
+
+    sgx_copy_from_enclave_verified(uptr, ptr, size);
     return true;
 }
 
@@ -340,11 +405,25 @@ static LISTP_TYPE(trusted_file) g_trusted_file_list = LISTP_INIT;
 static spinlock_t g_trusted_file_lock = INIT_SPINLOCK_UNLOCKED;
 static int g_file_check_policy = FILE_CHECK_POLICY_STRICT;
 
+static void find_path_in_uri(const char* uri, size_t uri_len, const char** out_path,
+                             size_t* out_path_len) {
+    if (strstartswith(uri, URI_PREFIX_FILE)) {
+        *out_path = uri + URI_PREFIX_FILE_LEN;
+        *out_path_len = uri_len - URI_PREFIX_FILE_LEN;
+        return;
+    }
+
+    assert(strstartswith(uri, URI_PREFIX_DEV));
+    *out_path = uri + URI_PREFIX_DEV_LEN;
+    *out_path_len = uri_len - URI_PREFIX_DEV_LEN;
+}
+
 /* assumes `path` is normalized */
 static bool path_is_equal_or_subpath(const struct trusted_file* tf, const char* path,
                                      size_t path_len) {
-    const char* tf_path = tf->uri + URI_PREFIX_FILE_LEN;
-    size_t tf_path_len  = tf->uri_len - URI_PREFIX_FILE_LEN;
+    const char* tf_path;
+    size_t tf_path_len;
+    find_path_in_uri(tf->uri, tf->uri_len, &tf_path, &tf_path_len);
 
     if (tf_path_len > path_len || memcmp(tf_path, path, tf_path_len)) {
         /* tf path is not a prefix of `path` */
@@ -382,8 +461,9 @@ struct trusted_file* get_trusted_or_allowed_file(const char* path) {
             }
         } else {
             /* trusted files: must be exactly the same URI */
-            const char* tf_path = tmp->uri + URI_PREFIX_FILE_LEN;
-            size_t tf_path_len  = tmp->uri_len - URI_PREFIX_FILE_LEN;
+            const char* tf_path;
+            size_t tf_path_len;
+            find_path_in_uri(tmp->uri, tmp->uri_len, &tf_path, &tf_path_len);
             if (tf_path_len == path_len && !memcmp(tf_path, path, path_len + 1)) {
                 tf = tmp;
                 break;
@@ -704,9 +784,16 @@ static int register_file(const char* uri, const char* hash_str, bool check_dupli
 static int normalize_and_register_file(const char* uri, const char* hash_str) {
     int ret;
 
-    if (!strstartswith(uri, URI_PREFIX_FILE)) {
-        log_error("Invalid URI [%s]: Trusted/allowed files must start with 'file:'", uri);
-        return -PAL_ERROR_INVAL;
+    if (hash_str) {
+        if (!strstartswith(uri, URI_PREFIX_FILE)) {
+            log_error("Invalid URI [%s]: Trusted files must start with 'file:'", uri);
+            return -PAL_ERROR_INVAL;
+        }
+    } else {
+        if (!strstartswith(uri, URI_PREFIX_FILE) && !strstartswith(uri, URI_PREFIX_DEV)) {
+            log_error("Invalid URI [%s]: Allowed files must start with 'file:' or 'dev:'", uri);
+            return -PAL_ERROR_INVAL;
+        }
     }
 
     const size_t norm_uri_size = strlen(uri) + 1;
@@ -715,10 +802,20 @@ static int normalize_and_register_file(const char* uri, const char* hash_str) {
         return -PAL_ERROR_NOMEM;
     }
 
-    memcpy(norm_uri, URI_PREFIX_FILE, URI_PREFIX_FILE_LEN);
-    size_t norm_path_size = norm_uri_size - URI_PREFIX_FILE_LEN;
-    if (!get_norm_path(uri + URI_PREFIX_FILE_LEN, norm_uri + URI_PREFIX_FILE_LEN,
-                       &norm_path_size)) {
+    const char* uri_prefix;
+    size_t uri_prefix_len;
+    if (strstartswith(uri, URI_PREFIX_FILE)) {
+        uri_prefix = URI_PREFIX_FILE;
+        uri_prefix_len = URI_PREFIX_FILE_LEN;
+    } else {
+        assert(strstartswith(uri, URI_PREFIX_DEV));
+        uri_prefix = URI_PREFIX_DEV;
+        uri_prefix_len = URI_PREFIX_DEV_LEN;
+    }
+
+    memcpy(norm_uri, uri_prefix, uri_prefix_len);
+    size_t norm_path_size = norm_uri_size - uri_prefix_len;
+    if (!get_norm_path(uri + uri_prefix_len, norm_uri + uri_prefix_len, &norm_path_size)) {
         log_error("Path (%s) normalization failed", uri);
         ret = -PAL_ERROR_INVAL;
         goto out;

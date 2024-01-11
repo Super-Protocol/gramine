@@ -164,7 +164,8 @@ Exitless feature
 ----------------
 
 Note this feature is currently insecure and not recommended for production
-usage (potentially susceptible to CVE-2022-21233 aka INTEL-SA-00657).
+usage (potentially susceptible to CVE-2022-21233 aka INTEL-SA-00657 and
+CVE-2022-21166 aka INTEL-SA-00615).
 
 Gramine supports the Exitless (or Switchless) feature – it trades off CPU cores
 for faster OCALL execution. More specifically, with Exitless, enclave threads do
@@ -215,26 +216,33 @@ untrusted RPC threads on another set of cores (e.g., on second hyper-threads).
 In general, the classical performance-tuning strategies are applicable for
 Gramine and Exitless multi-threaded workloads.
 
-Optional CPU features (AVX, AVX512, MPX, PKRU, AMX)
+Optional CPU features (AVX, AVX512, AMX, MPX, PKRU)
 ---------------------------------------------------
 
 SGX technology allows to specify which CPU features are required to run the SGX
-enclave. Gramine "inherits" this and has the following manifest options:
-``sgx.require_avx``, ``sgx.require_avx512``, ``sgx.require_mpx``,
-``sgx.require_pkru``, ``sgx.require_amx``. By default, all of them are set to
-``false`` – this means that SGX hardware will allow running the SGX enclave on
-any system, whether the system has AVX/AVX512/MPX/PKRU/AMX features or not.
+enclave. Gramine "inherits" this and has the manifest options for
+AVX/AVX512/AMX/MPX/PKRU CPU features under ``sgx.cpu_features``. By default, all
+not-security-hardening CPU features (AVX, AVX512, AMX) are set to
+``"unspecified"`` -- this means that Gramine will allow running the SGX enclave
+on any platform, whether the platform has the CPU features or not.
 
 Gramine typically correctly identifies the features of the underlying platform
-and propagates the information on AVX/AVX512/MPX/PKRU/AMX inside the enclave and
-to the application. It is recommended to leave these manifest options as-is (set
-to ``false``). However, we observed on some platforms that the graminized
+and propagates the information on AVX/AVX512/AMX inside the enclave and to the
+application. It is recommended to leave these manifest options as-is (set to
+``"unspecified"``). However, we observed on some platforms that the graminized
 application cannot detect these features and falls back to a slow
 implementation. For example, some crypto libraries do not recognize AVX on the
 platform and use very slow functions, leading to 10-100x overhead over native
 (we still don't know the reason for this behavior). If you suspect this can be
-your case, enable the features in the manifest, e.g., set ``sgx.require_avx =
-true``.
+your case, enable the features in the manifest, e.g., set ``sgx.cpu_features.avx
+= "required"``.
+
+Gramine also allows to explicitly disable CPU features using the ``"disabled"``
+keyword -- this disables the corresponding CPU feature inside the SGX enclave
+even if this CPU feature is available on the system. This may improve enclave
+performance because this CPU feature will *not* be saved and restored during
+enclave entry/exit. But be aware that if the graminized application relies on
+this CPU feature, the application will crash with "illegal instruction".
 
 For more information on SGX logic regarding optional CPU features, see the Intel
 Software Developer Manual, Table 38-3 ("Layout of ATTRIBUTES Structure") under
@@ -296,6 +304,8 @@ in Gramine:
 #. Inter-Process Communication (IPC) is moderately expensive in Gramine because
    all IPC is transparently encrypted/decrypted using the TLS-PSK with AES-GCM
    crypto.
+
+.. _choice_of_sgx_machine:
 
 Choice of SGX machine
 ---------------------
@@ -390,6 +400,44 @@ that each process spawns its own enclave, so in a multi-process application,
 the actual memory consumption will be a multiple of this setting. If the memory
 consumption is not a problem for your usecase, you might observe better
 performance with this approach than when limiting ``MALLOC_ARENA_MAX``.
+
+GNU libgomp performance bottleneck
+----------------------------------
+
+Many applications use the `libgomp library
+<https://gcc.gnu.org/onlinedocs/libgomp/>`__, the GNU Offloading and Multi
+Processing Runtime Library (previously known as GNU OpenMP Runtime Library).
+Notably PyTorch and TensorFlow use this library.
+
+Unfortunately, the libgomp library uses raw SYSCALL instructions in several
+places -- in particular, to call the ``futex()`` system call -- instead of the
+corresponding Glibc wrappers. This is detrimental to Gramine SGX performance,
+see :ref:`choice_of_sgx_machine`.
+
+Gramine optionally provides a patched libgomp library that runs faster
+inside SGX enclaves. This patched libgomp library is **not** included in the
+default distribution of Gramine, so you need to build Gramine from sources and
+add ``-Dlibgomp=enabled`` when configuring the build (for details see
+:doc:`devel/building`). Successful build places the patched libgomp library
+together with other Gramine libraries. Please note that the build can take a
+long time: unfortunately, the only supported way of building libgomp is as part
+of a complete GCC build.
+
+After building Gramine with patched libgomp, there is typically no need to
+modify your Gramine manifest (as the library is placed into the Gramine
+runtime-libraries directory, which is typically already a part of the manifest).
+However, sometimes using the patched libgomp requires specifying the
+``LD_PRELOAD`` environment variable. See `our PyTorch example
+<https://github.com/gramineproject/examples/tree/master/pytorch>`__ for one such
+case.
+
+The patched libgomp library can provide a significant boost: for example,
+PyTorch's SGX performance overhead decreases on some workloads from 25% to 8%.
+
+To the best of our knowledge, an alternative implementation of OpenMP -- the
+*libiomp* library -- does **not** have performance bottlenecks under Gramine
+SGX. We recommend to switch to this library whenever possible, instead of
+building and using the patched libgomp.
 
 Other considerations
 --------------------
@@ -561,6 +609,9 @@ use it:
    (optimizations enabled) makes Gramine performance more similar to release
    build.
 
+#. Profiling can be done only on debug enclaves. Add ``sgx.debug = true`` to
+   manifest.
+
 #. Add ``sgx.profile.enable = "main"`` to manifest (to collect data for the main
    process), or ``sgx.profile.enable = "all"`` (to collect data for all
    processes).
@@ -572,6 +623,12 @@ use it:
    multiple files will be written).
 
 #. Run ``perf report -i <data file>`` (see :ref:`perf` above).
+
+Some applications might run for a long time or forever (e.g. Redis), generating
+too much perf data. In such cases, user may want to terminate the application
+prematurely. Killing the application abruptly via SIGKILL will result in incorrect
+perf data. Instead, add ``sys.enable_sigterm_injection = true`` to manifest and
+terminate the application using command ``kill <pid>`` (i.e. send SIGTERM).
 
 *Note*: The accuracy of this tool is unclear (though we had positive experiences
 using the tool so far). The SGX profiling works by measuring the value of

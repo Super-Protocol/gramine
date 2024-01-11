@@ -111,10 +111,10 @@ __attribute_no_stack_protector
 __attribute_no_sanitize_address
 static void setup_asan(void) {
     int prot = PROT_READ | PROT_WRITE;
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED;
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE;
     void* addr = (void*)DO_SYSCALL(mmap, (void*)ASAN_SHADOW_START, ASAN_SHADOW_LENGTH, prot, flags,
                                    /*fd=*/-1, /*offset=*/0);
-    if (IS_PTR_ERR(addr)) {
+    if (IS_PTR_ERR(addr) || addr != (void*)ASAN_SHADOW_START) {
         /* We are super early in the init sequence, TCB is not yet set, we probably should not call
          * any logging functions. */
         DO_SYSCALL(exit_group, PAL_ERROR_NOMEM);
@@ -169,8 +169,12 @@ noreturn void pal_linux_main(void* initial_rsp, void* fini_callback) {
 
     /* relocate PAL */
     ret = setup_pal_binary();
-    if (ret < 0)
-        INIT_FAIL("Relocation of the PAL binary failed: %s", pal_strerror(ret));
+    if (ret < 0) {
+        /* PAL relocation failed, so we can't use functions which use PAL .rodata (like
+         * pal_strerror or unix_strerror) to report an error because these functions will return
+         * offset instead of actual address, which will cause a segfault. */
+        INIT_FAIL("Relocation of the PAL binary failed: %d", ret);
+    }
 
     uint64_t start_time;
     ret = _PalSystemTimeQuery(&start_time);
@@ -213,7 +217,7 @@ noreturn void pal_linux_main(void* initial_rsp, void* fini_callback) {
     if (ret < 0)
         INIT_FAIL("verify_hw_requirements() failed");
 
-    // Are we the first in this Gramine's namespace?
+    // Are we the first in this Gramine's instance?
     bool first_process = !strcmp(argv[2], "init");
     if (!first_process && strcmp(argv[2], "child")) {
         print_usage_and_exit(argv[0]);
@@ -386,5 +390,6 @@ noreturn void pal_linux_main(void* initial_rsp, void* fini_callback) {
     }
 
     /* call to main function */
-    pal_main(instance_id, parent, first_thread, first_process ? argv + 3 : argv + 5, envp);
+    pal_main(instance_id, parent, first_thread, first_process ? argv + 3 : argv + 5, envp,
+             /*post_callback=*/NULL);
 }

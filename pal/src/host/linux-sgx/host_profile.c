@@ -30,8 +30,6 @@
 #include "ittnotify.h" // for __itt_module_load(...) which is defined as a macro
 #endif
 
-extern bool g_vtune_profile_enabled;
-
 // FIXME: this is glibc realpath, declared here because the headers will conflict with PAL
 char* realpath(const char* path, char* resolved_path);
 
@@ -316,7 +314,7 @@ void sgx_profile_report_elf(const char* filename, void* addr) {
     if (!strcmp(filename, ""))
         filename = get_main_exec_path();
 
-    if (!strcmp(filename, "linux-vdso.so.1"))
+    if (!strcmp(filename, "[vdso_libos]"))
         return;
 
     // Convert filename to absolute path - some tools (e.g. libunwind in 'perf report') refuse to

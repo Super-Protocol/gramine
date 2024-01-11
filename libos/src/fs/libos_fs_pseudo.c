@@ -44,8 +44,12 @@ static struct pseudo_node* pseudo_find(struct libos_dentry* dent) {
         return pseudo_find_root(dent->mount->uri);
     }
 
+    assert(dent->parent != NULL);
     assert(dent->parent->inode);
+
     struct pseudo_node* parent_node = dent->parent->inode->data;
+    if (parent_node == NULL)
+        return NULL;
 
     /* Look for a child node with matching name */
     assert(parent_node->type == PSEUDO_DIR);
@@ -197,12 +201,12 @@ static int count_nlink(const char* name, void* arg) {
     return 0;
 }
 
-static dev_t makedev(unsigned int major, unsigned int minor) {
-    dev_t dev;
-    dev  = (((dev_t)(major & 0x00000fffu)) <<  8);
-    dev |= (((dev_t)(major & 0xfffff000u)) << 32);
-    dev |= (((dev_t)(minor & 0x000000ffu)) <<  0);
-    dev |= (((dev_t)(minor & 0xffffff00u)) << 12);
+static uint64_t makedev(unsigned int major, unsigned int minor) {
+    uint64_t dev;
+    dev  = (((uint64_t)(major & 0x00000fffu)) <<  8);
+    dev |= (((uint64_t)(major & 0xfffff000u)) << 32);
+    dev |= (((uint64_t)(minor & 0x000000ffu)) <<  0);
+    dev |= (((uint64_t)(minor & 0xffffff00u)) << 12);
     return dev;
 }
 
@@ -260,6 +264,11 @@ static int pseudo_stat(struct libos_dentry* dent, struct stat* buf) {
 
 static int pseudo_hstat(struct libos_handle* handle, struct stat* buf) {
     return pseudo_istat(handle->dentry, handle->inode, buf);
+}
+
+static int pseudo_unlink(struct libos_dentry* dent) {
+    __UNUSED(dent);
+    return -EACCES;
 }
 
 static int pseudo_follow_link(struct libos_dentry* dent, char** out_target) {
@@ -427,7 +436,7 @@ static int pseudo_truncate(struct libos_handle* hdl, file_off_t size) {
 
         case PSEUDO_DEV:
             if (!node->dev.dev_ops.truncate)
-                return -EACCES;
+                return -EINVAL;
             return node->dev.dev_ops.truncate(hdl, size);
 
         default:
@@ -482,6 +491,10 @@ static int pseudo_poll(struct libos_handle* hdl, int events, int* out_events) {
         }
 
         case PSEUDO_DEV: {
+            if (node->dev.dev_ops.poll)
+                return node->dev.dev_ops.poll(hdl, events, out_events);
+
+            /* if no handle-specific poll, then use a generic one */
             *out_events = 0;
             if (node->dev.dev_ops.read)
                 *out_events |= events & (POLLIN | POLLRDNORM);
@@ -588,6 +601,7 @@ struct libos_d_ops pseudo_d_ops = {
     .lookup      = &pseudo_lookup,
     .readdir     = &pseudo_readdir,
     .stat        = &pseudo_stat,
+    .unlink      = &pseudo_unlink,
     .follow_link = &pseudo_follow_link,
     .icheckpoint = &pseudo_icheckpoint,
     .irestore    = &pseudo_irestore,

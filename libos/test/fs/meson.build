@@ -43,13 +43,14 @@ tests = {
     'open_close': {},
     'open_flags': {},
     'read_write': {},
+    'read_write_mmap': {},
     'seek_tell': {},
     'seek_tell_truncate': {},
     'stat': {},
     'truncate': {},
 }
 
-install_dir = join_paths(pkglibdir, 'tests', 'libos', 'fs')
+install_dir = pkglibdir / 'tests' / 'libos' / 'fs'
 
 foreach name, params : tests
     exe = executable(name,

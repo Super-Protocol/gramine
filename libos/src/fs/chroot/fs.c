@@ -11,16 +11,16 @@
  * finished.
  */
 
-#include <asm/mman.h>
-#include <errno.h>
-#include <linux/fcntl.h>
-
 #include "libos_flags_conv.h"
 #include "libos_fs.h"
 #include "libos_handle.h"
 #include "libos_internal.h"
 #include "libos_lock.h"
 #include "libos_utils.h"
+#include "libos_vma.h"
+#include "linux_abi/errors.h"
+#include "linux_abi/fs.h"
+#include "linux_abi/memory.h"
 #include "pal.h"
 #include "perm.h"
 #include "stat.h"
@@ -136,17 +136,9 @@ static int chroot_lookup(struct libos_dentry* dent) {
      * We don't know the file type yet, so we can't construct a PAL URI with the right prefix. In
      * most cases, a "file:" prefix is good enough: `PalStreamAttributesQuery` will access the file
      * and report the right file type.
-     *
-     * The only exception is when this is the root dentry of a "dev:" mount, i.e. a directly mounted
-     * device. This is because PAL recognizes a special "dev:tty" device, which needs to be referred
-     * to by this exact URI (and "file:tty" will not work).
      */
     char* uri = NULL;
-    mode_t tmp_type = S_IFREG;
-    if (!dent->parent && strstartswith(dent->mount->uri, URI_PREFIX_DEV))
-        tmp_type = S_IFCHR;
-
-    ret = chroot_dentry_uri(dent, tmp_type, &uri);
+    ret = chroot_dentry_uri(dent, S_IFREG, &uri);
     if (ret < 0)
         goto out;
 
@@ -233,7 +225,7 @@ static int chroot_do_open(struct libos_handle* hdl, struct libos_dentry* dent, m
         hdl->pos = 0;
         hdl->pal_handle = palhdl;
     } else {
-        PalObjectClose(palhdl);
+        PalObjectDestroy(palhdl);
     }
     ret = 0;
 
@@ -319,7 +311,17 @@ static ssize_t chroot_write(struct libos_handle* hdl, const void* buf, size_t co
             hdl->inode->size = *pos;
         unlock(&hdl->inode->lock);
     }
-    return actual_count;
+
+    /* If there are any MAP_SHARED mappings for the file, this will read data from `hdl`. */
+    if (__atomic_load_n(&hdl->inode->num_mmapped, __ATOMIC_ACQUIRE) != 0) {
+        ret = reload_mmaped_from_file_handle(hdl);
+        if (ret < 0) {
+            log_error("reload mmapped regions of file failed: %s", unix_strerror(ret));
+            BUG();
+        }
+    }
+
+    return (ssize_t)actual_count;
 }
 
 static int chroot_mmap(struct libos_handle* hdl, void* addr, size_t size, int prot, int flags,
@@ -337,22 +339,6 @@ static int chroot_mmap(struct libos_handle* hdl, void* addr, size_t size, int pr
         return pal_to_unix_errno(ret);
 
     return 0;
-}
-
-static int chroot_truncate(struct libos_handle* hdl, file_off_t size) {
-    assert(hdl->type == TYPE_CHROOT);
-
-    int ret;
-
-    lock(&hdl->inode->lock);
-    ret = PalStreamSetLength(hdl->pal_handle, size);
-    if (ret == 0) {
-        hdl->inode->size = size;
-    } else {
-        ret = pal_to_unix_errno(ret);
-    }
-    unlock(&hdl->inode->lock);
-    return ret;
 }
 
 int chroot_readdir(struct libos_dentry* dent, readdir_callback_t callback, void* arg) {
@@ -411,7 +397,7 @@ int chroot_readdir(struct libos_dentry* dent, readdir_callback_t callback, void*
 
 out:
     free(buf);
-    PalObjectClose(palhdl);
+    PalObjectDestroy(palhdl);
     return ret;
 }
 
@@ -427,7 +413,7 @@ int chroot_unlink(struct libos_dentry* dent) {
         return ret;
 
     ret = PalStreamDelete(palhdl, PAL_DELETE_ALL);
-    PalObjectClose(palhdl);
+    PalObjectDestroy(palhdl);
     if (ret < 0)
         return pal_to_unix_errno(ret);
 
@@ -451,7 +437,7 @@ static int chroot_rename(struct libos_dentry* old, struct libos_dentry* new) {
         goto out;
 
     ret = PalStreamChangeName(palhdl, new_uri);
-    PalObjectClose(palhdl);
+    PalObjectDestroy(palhdl);
     if (ret < 0) {
         ret = pal_to_unix_errno(ret);
         goto out;
@@ -469,28 +455,31 @@ static int chroot_chmod(struct libos_dentry* dent, mode_t perm) {
 
     int ret;
 
-    lock(&dent->inode->lock);
-
     PAL_HANDLE palhdl;
     ret = chroot_temp_open(dent, dent->inode->type, &palhdl);
     if (ret < 0)
-        goto out;
+        return ret;
 
     mode_t host_perm = HOST_PERM(perm);
     PAL_STREAM_ATTR attr = {.share_flags = host_perm};
     ret = PalStreamAttributesSetByHandle(palhdl, &attr);
-    PalObjectClose(palhdl);
-    if (ret < 0) {
-        ret = pal_to_unix_errno(ret);
-        goto out;
-    }
+    PalObjectDestroy(palhdl);
+    if (ret < 0)
+        return pal_to_unix_errno(ret);
 
-    dent->inode->perm = perm;
-    ret = 0;
+    return 0;
+}
 
-out:
-    unlock(&dent->inode->lock);
-    return ret;
+static int chroot_fchmod(struct libos_handle* hdl, mode_t perm) {
+    int ret;
+
+    mode_t host_perm = HOST_PERM(perm);
+    PAL_STREAM_ATTR attr = {.share_flags = host_perm};
+    ret = PalStreamAttributesSetByHandle(hdl->pal_handle, &attr);
+    if (ret < 0)
+        return pal_to_unix_errno(ret);
+
+    return 0;
 }
 
 struct libos_fs_ops chroot_fs_ops = {
@@ -504,8 +493,9 @@ struct libos_fs_ops chroot_fs_ops = {
      * breaks for such device-specific cases */
     .seek       = &generic_inode_seek,
     .hstat      = &generic_inode_hstat,
-    .truncate   = &chroot_truncate,
+    .truncate   = &generic_truncate,
     .poll       = &generic_inode_poll,
+    .fchmod     = &chroot_fchmod,
 };
 
 struct libos_d_ops chroot_d_ops = {

@@ -262,16 +262,6 @@ static void configure_logging(void) {
     int ret = 0;
     int log_level = PAL_LOG_DEFAULT_LEVEL;
 
-    char* debug_type = NULL;
-    ret = toml_string_in(g_pal_public_state.manifest_root, "loader.debug_type", &debug_type);
-    if (ret < 0)
-        INIT_FAIL_MANIFEST("Cannot parse 'loader.debug_type'");
-    if (debug_type) {
-        free(debug_type);
-        INIT_FAIL_MANIFEST("'loader.debug_type' has been replaced by 'loader.log_level' and "
-                           "'loader.log_file'");
-    }
-
     char* log_level_str = NULL;
     ret = toml_string_in(g_pal_public_state.manifest_root, "loader.log_level", &log_level_str);
     if (ret < 0)
@@ -361,10 +351,11 @@ static int load_cstring_array(const char* uri, const char*** res) {
                 *(argv_it++) = buf + i + 1;
     }
     *res = array;
-    return _PalObjectClose(hdl);
+    _PalObjectDestroy(hdl);
+    return 0;
 
 out_fail:
-    (void)_PalObjectClose(hdl);
+    _PalObjectDestroy(hdl);
     free(buf);
     free(array);
     return ret;
@@ -378,14 +369,15 @@ noreturn void pal_main(uint64_t instance_id,       /* current instance id */
                        PAL_HANDLE parent_process,  /* parent process if it's a child */
                        PAL_HANDLE first_thread,    /* first thread handle */
                        const char** arguments,     /* application arguments */
-                       const char** environments   /* environment variables */) {
+                       const char** environments   /* environment variables */,
+                       void (*post_callback)(void) /* callback into host-specific loader */) {
     if (!instance_id) {
         assert(!parent_process);
         if (_PalRandomBitsRead(&instance_id, sizeof(instance_id)) < 0) {
             INIT_FAIL("Could not generate random instance_id");
         }
     }
-    g_pal_common_state.instance_id = instance_id;
+    g_pal_public_state.instance_id = instance_id;
     g_pal_common_state.parent_process = parent_process;
 
     ssize_t ret;
@@ -586,17 +578,13 @@ noreturn void pal_main(uint64_t instance_id,       /* current instance id */
     }
     g_pal_public_state.mem_total = _PalMemoryQuota();
 
-    if (toml_key_exists(g_pal_public_state.manifest_root,
-                        "fs.experimental__enable_sysfs_topology")) {
-        // TODO: Deprecation started in v1.2, drop in 2 releases.
-        log_warning("fs.experimental__enable_sysfs_topology is deprecated and sysfs topology is "
-                    "enabled by default now.");
-    }
-
     ret = load_entrypoint(entrypoint_name);
     if (ret < 0)
         INIT_FAIL("Unable to load loader.entrypoint: %ld", ret);
     free(entrypoint_name);
+
+    if (post_callback)
+        post_callback();
 
     pal_disable_early_memory_bookkeeping();
 

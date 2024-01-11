@@ -64,6 +64,9 @@ static int generic_istat(struct libos_inode* inode, struct stat* buf) {
     buf->st_size = inode->size;
     buf->st_uid  = inode->uid;
     buf->st_gid  = inode->gid;
+    buf->st_atime = inode->atime;
+    buf->st_mtime = inode->mtime;
+    buf->st_ctime = inode->ctime;
 
     /* Some programs (e.g. some tests from LTP) require this value. We've picked some random,
      * pretty looking constant - exact value should not affect anything (perhaps except
@@ -232,5 +235,17 @@ out:
             BUG();
         }
     }
+    return ret;
+}
+
+int generic_truncate(struct libos_handle* hdl, file_off_t size) {
+    lock(&hdl->inode->lock);
+    int ret = PalStreamSetLength(hdl->pal_handle, size);
+    if (ret == 0) {
+        hdl->inode->size = size;
+    } else {
+        ret = pal_to_unix_errno(ret);
+    }
+    unlock(&hdl->inode->lock);
     return ret;
 }

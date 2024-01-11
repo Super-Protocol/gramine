@@ -35,16 +35,114 @@ static uint64_t g_start_tsc = 0;
 static uint64_t g_start_usec = 0;
 static seqlock_t g_tsc_lock = INIT_SEQLOCK_UNLOCKED;
 
-/**
- * Initialize the data structures used for date/time emulation using TSC
- */
-void init_tsc(void) {
-    if (is_tsc_usable()) {
-        g_tsc_hz = get_tsc_hz();
-    }
+static bool is_tsc_usable(void) {
+    uint32_t words[CPUID_WORD_NUM];
+    _PalCpuIdRetrieve(INVARIANT_TSC_LEAF, 0, words);
+    return words[CPUID_WORD_EDX] & (1 << 8);
 }
 
-/* TODO: result comes from the untrusted host, introduce some schielding */
+/* return TSC frequency or 0 if invariant TSC is not supported */
+static uint64_t get_tsc_hz_baremetal(void) {
+    uint32_t words[CPUID_WORD_NUM];
+
+    /*
+     * Based on "Time Stamp Counter and Nominal Core Crystal Clock Information" leaf, calculate TSC
+     * frequency as ECX * EBX / EAX, where
+     *   - EAX is denominator of the TSC/"core crystal clock" ratio,
+     *   - EBX is numerator of the TSC/"core crystal clock" ratio,
+     *   - ECX is core crystal clock (nominal) frequency in Hz.
+     */
+    _PalCpuIdRetrieve(TSC_FREQ_LEAF, 0, words);
+    if (!words[CPUID_WORD_EAX] || !words[CPUID_WORD_EBX]) {
+        /* TSC/core crystal clock ratio is not enumerated, can't use RDTSC for accurate time */
+        return 0;
+    }
+
+    if (words[CPUID_WORD_ECX] > 0) {
+        /* cast to 64-bit first to prevent integer overflow */
+        return (uint64_t)words[CPUID_WORD_ECX] * words[CPUID_WORD_EBX] / words[CPUID_WORD_EAX];
+    }
+
+    /* some Intel CPUs do not report nominal frequency of crystal clock, let's calculate it
+     * based on Processor Frequency Information Leaf (CPUID 16H); this leaf always exists if
+     * TSC Frequency Leaf exists; logic is taken from Linux 5.11's arch/x86/kernel/tsc.c */
+    _PalCpuIdRetrieve(PROC_FREQ_LEAF, 0, words);
+    if (!words[CPUID_WORD_EAX]) {
+        /* processor base frequency (in MHz) is not enumerated, can't calculate frequency */
+        return 0;
+    }
+
+    /* processor base frequency is in MHz but we need to return TSC frequency in Hz; cast to 64-bit
+     * first to prevent integer overflow */
+    return (uint64_t)words[CPUID_WORD_EAX] * 1000000;
+}
+
+/* return TSC frequency or 0 if invariant TSC is not supported */
+static uint64_t get_tsc_hz_hypervisor(void) {
+    uint32_t words[CPUID_WORD_NUM];
+
+    /*
+     * We rely on the Generic CPUID space for hypervisors:
+     *   - 0x40000000: EAX: The maximum input value for CPUID supported by the hypervisor
+     *   -             EBX, ECX, EDX: Hypervisor vendor ID signature (hypervisor_id)
+     *
+     * If we detect QEMU/KVM or Cloud Hypervisor/KVM (hypervisor_id = "KVMKVMKVM") or VMWare
+     * ("VMwareVMware"), then we assume that leaf 0x40000010 contains virtual TSC frequency in kHz
+     * in EAX. We check hypervisor_id because leaf 0x40000010 is not standardized and e.g. Microsoft
+     * Hyper-V may use it for other purposes.
+     *
+     * Relevant materials:
+     * - https://github.com/qemu/qemu/commit/9954a1582e18b03ddb66f6c892dccf2c3508f4b2
+     * - qemu/target/i386/cpu.h, qemu/target/i386/cpu.c, qemu/target/i386/kvm/kvm.c sources
+     * - https://github.com/freebsd/freebsd-src/blob/9df6eea/sys/x86/x86/identcpu.c#L1372-L1377 (for
+     *   the list of hypervisor_id values)
+     */
+    _PalCpuIdRetrieve(HYPERVISOR_INFO_LEAF, 0, words);
+
+    bool is_kvm    = words[CPUID_WORD_EBX] == 0x4b4d564b
+                         && words[CPUID_WORD_ECX] == 0x564b4d56
+                         && words[CPUID_WORD_EDX] == 0x0000004d;
+    bool is_vmware = words[CPUID_WORD_EBX] == 0x61774d56
+                         && words[CPUID_WORD_ECX] == 0x4d566572
+                         && words[CPUID_WORD_EDX] == 0x65726177;
+
+    if (!is_kvm && !is_vmware) {
+        /* not a hypervisor that contains "virtual TSC frequency" in leaf 0x40000010 */
+        return 0;
+    }
+
+    if (words[CPUID_WORD_EAX] < HYPERVISOR_VMWARE_TIME_LEAF) {
+        /* virtual TSC frequency is not available */
+        return 0;
+    }
+
+    _PalCpuIdRetrieve(HYPERVISOR_VMWARE_TIME_LEAF, 0, words);
+    if (!words[CPUID_WORD_EAX]) {
+        /* TSC frequency (in kHz) is not enumerated, can't calculate frequency */
+        return 0;
+    }
+
+    /* TSC frequency is in kHz but we need to return TSC frequency in Hz; cast to 64-bit first to
+     * prevent integer overflow */
+    return (uint64_t)words[CPUID_WORD_EAX] * 1000;
+}
+
+/* initialize the data structures used for date/time emulation using TSC */
+void init_tsc(void) {
+    if (!is_tsc_usable())
+        return;
+
+    g_tsc_hz = get_tsc_hz_baremetal();
+    if (g_tsc_hz)
+        return;
+
+    /* hypervisors may not expose crystal-clock frequency CPUID leaves, so instead try
+     * hypervisor-special synthetic CPUID leaf 0x40000010 (VMWare-style Timing Information) */
+    g_tsc_hz = get_tsc_hz_hypervisor();
+    if (g_tsc_hz)
+        return;
+}
+
 int _PalSystemTimeQuery(uint64_t* out_usec) {
     int ret;
 
@@ -63,6 +161,8 @@ int _PalSystemTimeQuery(uint64_t* out_usec) {
     } while (read_seqretry(&g_tsc_lock, seq));
 
     uint64_t usec = 0;
+    /* Last seen RDTSC-calculated time value. This guards against time rewinding. */
+    static uint64_t last_usec = 0;
     if (start_tsc > 0 && start_usec > 0) {
         /* baseline TSC/usec pair was initialized, can calculate time via RDTSC (but should be
          * careful with integer overflow during calculations) */
@@ -75,13 +175,21 @@ int _PalSystemTimeQuery(uint64_t* out_usec) {
                 usec = start_usec + diff_usec;
                 if (usec < start_usec)
                     return -PAL_ERROR_OVERFLOW;
+
+                /* It's simply `last_usec = max(last_usec, usec)`, but executed atomically. */
+                uint64_t expected_usec = __atomic_load_n(&last_usec, __ATOMIC_ACQUIRE);
+                while (expected_usec < usec) {
+                    if (__atomic_compare_exchange_n(&last_usec, &expected_usec, usec,
+                                                    /*weak=*/true, __ATOMIC_RELEASE,
+                                                    __ATOMIC_ACQUIRE)) {
+                        break;
+                    }
+                }
+
+                *out_usec = MAX(usec, expected_usec);
+                return 0;
             }
         }
-    }
-
-    if (usec) {
-        *out_usec = usec;
-        return 0;
     }
 
     /* if we are here, either the baseline TSC/usec pair was not yet initialized or too much time
@@ -91,6 +199,14 @@ int _PalSystemTimeQuery(uint64_t* out_usec) {
     if (ret < 0)
         return -PAL_ERROR_DENIED;
     uint64_t tsc_cyc2 = get_tsc();
+
+    uint64_t last_recorded_rdtsc = __atomic_load_n(&last_usec, __ATOMIC_ACQUIRE);
+    if (usec < last_recorded_rdtsc) {
+        /* new OCALL-obtained timestamp (`usec`) is "back in time" than the last recorded timestamp
+         * from RDTSC (`last_recorded_rdtsc`); this can happen if the actual host time drifted
+         * backwards compared to the RDTSC time. */
+         usec = last_recorded_rdtsc;
+    }
 
     /* we need to match the OCALL-obtained timestamp (`usec`) with the RDTSC-obtained number of
      * cycles (`tsc_cyc`); since OCALL is a time-consuming operation, we estimate `tsc_cyc` as a
@@ -397,8 +513,13 @@ static const struct cpuid_leaf cpuid_known_leaves[] = {
     {.leaf = 0x1F, .zero_subleaf = false, .cache = false}, /* Intel V2 Ext Topology Enumeration */
     /* basic CPUID leaf functions end here */
 
+    /* hypervisor-specific CPUID leaf functions (0x40000000 - 0x400000FF) start here */
+    {.leaf = 0x40000000, .zero_subleaf = true, .cache = true},  /* CPUID Info */
+    {.leaf = 0x40000010, .zero_subleaf = true, .cache = true},  /* VMWare-style Timing Info */
+    /* NOTE: currently only the above two leaves are used, see also get_tsc_hz_hypervisor() */
+
     /* invalid CPUID leaf functions (no existing or future CPU will return any meaningful
-     * information in these leaves) occupy 40000000 - 4FFFFFFFH -- they are treated the same as
+     * information in these leaves) occupy 0x40000100 - 0x4FFFFFFF -- they are treated the same as
      * unrecognized leaves, see code below */
 
     /* extended CPUID leaf functions start here */
@@ -628,9 +749,9 @@ int _PalGetSpecialKey(const char* name, void* key, size_t* key_size) {
         return -PAL_ERROR_INVAL;
 
     int ret;
-    if (!strcmp(name, "_sgx_mrenclave")) {
+    if (!strcmp(name, PAL_KEY_NAME_SGX_MRENCLAVE)) {
         ret = sgx_get_seal_key(SGX_KEYPOLICY_MRENCLAVE, &sgx_key);
-    } else if (!strcmp(name, "_sgx_mrsigner")) {
+    } else if (!strcmp(name, PAL_KEY_NAME_SGX_MRSIGNER)) {
         ret = sgx_get_seal_key(SGX_KEYPOLICY_MRSIGNER, &sgx_key);
     } else {
         return -PAL_ERROR_NOTIMPLEMENTED;
@@ -654,44 +775,6 @@ ssize_t read_file_buffer(const char* filename, char* buf, size_t buf_size) {
     ocall_close(fd);
 
     return n;
-}
-
-bool is_tsc_usable(void) {
-    uint32_t words[CPUID_WORD_NUM];
-    _PalCpuIdRetrieve(INVARIANT_TSC_LEAF, 0, words);
-    return words[CPUID_WORD_EDX] & 1 << 8;
-}
-
-/* return TSC frequency or 0 if invariant TSC is not supported */
-uint64_t get_tsc_hz(void) {
-    uint32_t words[CPUID_WORD_NUM];
-
-    _PalCpuIdRetrieve(TSC_FREQ_LEAF, 0, words);
-    if (!words[CPUID_WORD_EAX] || !words[CPUID_WORD_EBX]) {
-        /* TSC/core crystal clock ratio is not enumerated, can't use RDTSC for accurate time */
-        return 0;
-    }
-
-    if (words[CPUID_WORD_ECX] > 0) {
-        /* calculate TSC frequency as core crystal clock frequency (EAX) * EBX / EAX; cast to 64-bit
-         * first to prevent integer overflow */
-        uint64_t ecx_hz = words[CPUID_WORD_ECX];
-        return ecx_hz * words[CPUID_WORD_EBX] / words[CPUID_WORD_EAX];
-    }
-
-    /* some Intel CPUs do not report nominal frequency of crystal clock, let's calculate it
-     * based on Processor Frequency Information Leaf (CPUID 16H); this leaf always exists if
-     * TSC Frequency Leaf exists; logic is taken from Linux 5.11's arch/x86/kernel/tsc.c */
-    _PalCpuIdRetrieve(PROC_FREQ_LEAF, 0, words);
-    if (!words[CPUID_WORD_EAX]) {
-        /* processor base frequency (in MHz) is not enumerated, can't calculate frequency */
-        return 0;
-    }
-
-    /* processor base frequency is in MHz but we need to return TSC frequency in Hz; cast to 64-bit
-     * first to prevent integer overflow */
-    uint64_t base_frequency_mhz = words[CPUID_WORD_EAX];
-    return base_frequency_mhz * 1000000;
 }
 
 int _PalRandomBitsRead(void* buffer, size_t size) {

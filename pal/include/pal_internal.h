@@ -28,7 +28,6 @@
  * PAL.
  */
 struct pal_common_state {
-    uint64_t instance_id;
     PAL_HANDLE parent_process;
     const char* raw_manifest_data;
 };
@@ -49,11 +48,14 @@ struct handle_ops {
     int64_t (*read)(PAL_HANDLE handle, uint64_t offset, uint64_t count, void* buffer);
     int64_t (*write)(PAL_HANDLE handle, uint64_t offset, uint64_t count, const void* buffer);
 
-    /* 'close' and 'delete' is used by PalObjectClose and PalStreamDelete, 'close' will close the
-     * stream, while 'delete' actually destroy the stream, such as deleting a file or shutting
-     * down a socket */
-    int (*close)(PAL_HANDLE handle);
+    /* 'delete' is used by PalStreamDelete: for files and dirs it corresponds to unlinking, for
+     * sockets it corresponds to shutting down a socket connection. */
     int (*delete)(PAL_HANDLE handle, enum pal_delete_mode delete_mode);
+
+    /* 'destroy' is used by PalObjectDestroy: it closes all associated resources on the host (e.g.
+     * closes the host FD), frees all sub-objects of the PAL handle (e.g. a filename string) and
+     * finally frees the PAL handle object itself */
+    void (*destroy)(PAL_HANDLE handle);
 
     /*
      * 'map' and 'unmap' will map or unmap the handle into memory space, it's not necessary mapped
@@ -117,7 +119,7 @@ struct socket_ops {
     int (*accept)(PAL_HANDLE handle, pal_stream_options_t options, PAL_HANDLE* out_client,
                   struct pal_socket_addr* out_client_addr, struct pal_socket_addr* out_local_addr);
     int (*connect)(PAL_HANDLE handle, struct pal_socket_addr* addr,
-                   struct pal_socket_addr* out_local_addr);
+                   struct pal_socket_addr* out_local_addr, bool* out_inprogress);
     int (*send)(PAL_HANDLE handle, struct iovec* iov, size_t iov_len, size_t* out_size,
                 struct pal_socket_addr* addr, bool force_nonblocking);
     int (*recv)(PAL_HANDLE handle, struct iovec* iov, size_t iov_len, size_t* out_size,
@@ -148,15 +150,19 @@ void notify_failure(unsigned long error);
  * \param first_thread    First thread handle.
  * \param arguments       Application arguments.
  * \param environments    Environment variables.
+ * \param post_callback   Callback into host-specific loader, useful for post-initialization actions
+ *                        like additional logging. Can be NULL.
  *
  * This function must be called by the host-specific loader.
  */
 noreturn void pal_main(uint64_t instance_id, PAL_HANDLE parent_process, PAL_HANDLE first_thread,
-                       const char** arguments, const char** environments);
+                       const char** arguments, const char** environments,
+                       void (*post_callback)(void));
 
 /* For initialization */
 
 unsigned long _PalMemoryQuota(void);
+int _PalDeviceIoControl(PAL_HANDLE handle, uint32_t cmd, unsigned long arg, int* out_ret);
 // Returns 0 on success, negative PAL code on failure
 int _PalGetCPUInfo(struct pal_cpu_info* info);
 
@@ -171,7 +177,6 @@ int _PalStreamAttributesQuery(const char* uri, PAL_STREAM_ATTR* attr);
 int _PalStreamAttributesQueryByHandle(PAL_HANDLE hdl, PAL_STREAM_ATTR* attr);
 int _PalStreamMap(PAL_HANDLE handle, void* addr, pal_prot_flags_t prot, uint64_t offset,
                   uint64_t size);
-int _PalStreamUnmap(void* addr, uint64_t size);
 int64_t _PalStreamSetLength(PAL_HANDLE handle, uint64_t length);
 int _PalStreamFlush(PAL_HANDLE handle);
 int _PalSendHandle(PAL_HANDLE target_process, PAL_HANDLE cargo);
@@ -185,7 +190,7 @@ int _PalSocketAccept(PAL_HANDLE handle, pal_stream_options_t options, PAL_HANDLE
                      struct pal_socket_addr* out_client_addr,
                      struct pal_socket_addr* out_local_addr);
 int _PalSocketConnect(PAL_HANDLE handle, struct pal_socket_addr* addr,
-                      struct pal_socket_addr* out_local_addr);
+                      struct pal_socket_addr* out_local_addr, bool* out_inprogress);
 int _PalSocketSend(PAL_HANDLE handle, struct iovec* iov, size_t iov_len, size_t* out_size,
                    struct pal_socket_addr* addr, bool force_nonblocking);
 int _PalSocketRecv(PAL_HANDLE handle, struct iovec* iov, size_t iov_len, size_t* out_total_size,
@@ -214,7 +219,7 @@ int _PalVirtualMemoryFree(void* addr, uint64_t size);
 int _PalVirtualMemoryProtect(void* addr, uint64_t size, pal_prot_flags_t prot);
 
 /* PalObject calls */
-int _PalObjectClose(PAL_HANDLE object_handle);
+void _PalObjectDestroy(PAL_HANDLE object_handle);
 int _PalStreamsWaitEvents(size_t count, PAL_HANDLE* handle_array, pal_wait_flags_t* events,
                           pal_wait_flags_t* ret_events, uint64_t* timeout_us);
 
@@ -284,18 +289,8 @@ void pal_disable_early_memory_bookkeeping(void);
 
 void init_slab_mgr(void);
 void* malloc(size_t size);
-void* malloc_copy(const void* mem, size_t size);
 void* calloc(size_t num, size_t size);
 void free(void* mem);
-
-#ifdef __GNUC__
-#define __attribute_hidden        __attribute__((visibility("hidden")))
-#define __attribute_always_inline __attribute__((always_inline))
-#define __attribute_unused        __attribute__((unused))
-#define __attribute_noinline      __attribute__((noinline))
-#else
-#error Unsupported compiler
-#endif
 
 int _PalInitDebugStream(const char* path);
 int _PalDebugLog(const void* buf, size_t size);

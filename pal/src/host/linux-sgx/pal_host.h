@@ -74,6 +74,11 @@ typedef struct {
 
         struct {
             PAL_IDX fd;
+        } console;
+
+        struct {
+            PAL_IDX fd;
+            char* realpath;
             bool nonblocking;
         } dev;
 
@@ -133,8 +138,12 @@ typedef struct {
             bool signaled;
             bool auto_clear;
             /* Access to the *content* of this field should be atomic, because it's used as futex
-             * word on the untrusted host. */
-            uint32_t* signaled_untrusted;
+             * word on the untrusted host. We use 8-byte ints instead of classic 4-byte ints for
+             * this futex word. This is to mitigate CVE-2022-21166 (INTEL-SA-00615) which requires
+             * all writes to untrusted memory from within the enclave to be done in 8-byte chunks
+             * aligned to 8-bytes boundary. We can safely typecast this 8-byte int to a 4-byte futex
+             * word because Intel SGX implies a little-endian CPU. */
+            uint64_t* signaled_untrusted;
         } event;
     };
 }* PAL_HANDLE;
@@ -145,5 +154,7 @@ typedef struct {
  * writable respectively. If none of these is set, then the handle has no host-level fd. */
 #define PAL_HANDLE_FD_READABLE  1
 #define PAL_HANDLE_FD_WRITABLE  2
-/* Set if an error was seen on this handle. Currently only set by `_PalStreamsWaitEvents`. */
+/* Set if an error was seen on this handle. */
 #define PAL_HANDLE_FD_ERROR     4
+/* Set if a hang-up was seen on this handle. */
+#define PAL_HANDLE_FD_HANG_UP   8

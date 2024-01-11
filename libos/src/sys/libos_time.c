@@ -5,30 +5,35 @@
  * Implementation of system calls "gettimeofday", "time" and "clock_gettime".
  */
 
-#include <errno.h>
-
 #include "libos_internal.h"
 #include "libos_table.h"
+#include "linux_abi/errors.h"
 #include "pal.h"
 
 long libos_syscall_gettimeofday(struct __kernel_timeval* tv, struct __kernel_timezone* tz) {
-    if (!tv)
-        return -EINVAL;
+    if (tv) {
+        if (!is_user_memory_writable(tv, sizeof(*tv)))
+            return -EFAULT;
 
-    if (!is_user_memory_writable(tv, sizeof(*tv)))
-        return -EFAULT;
+        uint64_t time = 0;
+        int ret = PalSystemTimeQuery(&time);
+        if (ret < 0) {
+            return pal_to_unix_errno(ret);
+        }
 
-    if (tz && !is_user_memory_writable(tz, sizeof(*tz)))
-        return -EFAULT;
-
-    uint64_t time = 0;
-    int ret = PalSystemTimeQuery(&time);
-    if (ret < 0) {
-        return pal_to_unix_errno(ret);
+        tv->tv_sec  = time / 1000000;
+        tv->tv_usec = time % 1000000;
     }
 
-    tv->tv_sec  = time / 1000000;
-    tv->tv_usec = time % 1000000;
+    if (tz) {
+        if (!is_user_memory_writable(tz, sizeof(*tz)))
+            return -EFAULT;
+
+        /* Not implemented, return zeros. */
+        tz->tz_minuteswest = 0;
+        tz->tz_dsttime = 0;
+    }
+
     return 0;
 }
 
@@ -53,9 +58,6 @@ long libos_syscall_time(time_t* tloc) {
 long libos_syscall_clock_gettime(clockid_t which_clock, struct timespec* tp) {
     /* all clocks are the same */
     if (!(0 <= which_clock && which_clock < MAX_CLOCKS))
-        return -EINVAL;
-
-    if (!tp)
         return -EINVAL;
 
     if (!is_user_memory_writable(tp, sizeof(*tp)))

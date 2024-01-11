@@ -9,13 +9,12 @@
  * ends up here (__system_alloc and __system_free).
  */
 
-#include <asm/mman.h>
-
 #include "asan.h"
 #include "libos_internal.h"
 #include "libos_lock.h"
 #include "libos_utils.h"
 #include "libos_vma.h"
+#include "linux_abi/memory.h"
 #include "pal.h"
 
 static struct libos_lock slab_mgr_lock;
@@ -135,14 +134,6 @@ void* realloc(void* ptr, size_t new_size) {
     return new_buf;
 }
 #endif
-
-// Copies data from `mem` to a newly allocated buffer of a specified size.
-void* malloc_copy(const void* mem, size_t size) {
-    void* buff = malloc(size);
-    if (buff)
-        memcpy(buff, mem, size);
-    return buff;
-}
 
 void free(void* mem) {
     if (memory_migrated(mem)) {

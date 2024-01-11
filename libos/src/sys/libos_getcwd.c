@@ -5,8 +5,6 @@
  * Implementation of system calls "getcwd", "chdir" and "fchdir".
  */
 
-#include <errno.h>
-
 #include "libos_fs.h"
 #include "libos_handle.h"
 #include "libos_internal.h"
@@ -14,6 +12,7 @@
 #include "libos_process.h"
 #include "libos_table.h"
 #include "libos_thread.h"
+#include "linux_abi/errors.h"
 #include "stat.h"
 
 #ifndef ERANGE
@@ -21,9 +20,6 @@
 #endif
 
 long libos_syscall_getcwd(char* buf, size_t buf_size) {
-    if (!buf || !buf_size)
-        return -EINVAL;
-
     if (!is_user_memory_writable(buf, buf_size))
         return -EFAULT;
 
@@ -88,6 +84,10 @@ long libos_syscall_fchdir(int fd) {
 
     struct libos_dentry* dent = hdl->dentry;
 
+    if (!dent) {
+        log_debug("FD=%d has no path in the filesystem", fd);
+        return -ENOTDIR;
+    }
     if (!dent->inode || dent->inode->type != S_IFDIR) {
         char* path = NULL;
         dentry_abs_path(dent, &path, /*size=*/NULL);

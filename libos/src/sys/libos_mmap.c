@@ -9,14 +9,14 @@
  * Implementation of system calls "mmap", "munmap" and "mprotect".
  */
 
-#include <errno.h>
-
 #include "libos_flags_conv.h"
 #include "libos_fs.h"
 #include "libos_handle.h"
 #include "libos_internal.h"
 #include "libos_table.h"
 #include "libos_vma.h"
+#include "linux_abi/errors.h"
+#include "linux_abi/memory.h"
 #include "pal.h"
 #include "pal_error.h"
 
@@ -44,10 +44,32 @@
                        | MAP_HUGE_2MB           \
                        | MAP_HUGE_1GB)
 
+static int check_prot(int prot) {
+    if (prot & ~(PROT_NONE | PROT_READ | PROT_WRITE | PROT_EXEC | PROT_GROWSDOWN | PROT_GROWSUP |
+                 PROT_SEM)) {
+        return -EINVAL;
+    }
+
+    if ((prot & (PROT_GROWSDOWN | PROT_GROWSUP)) == (PROT_GROWSDOWN | PROT_GROWSUP)) {
+        return -EINVAL;
+    }
+
+    /* We do not support these flags (at least yet). */
+    if (prot & (PROT_GROWSUP | PROT_SEM)) {
+        return -EOPNOTSUPP;
+    }
+
+    return 0;
+}
+
 void* libos_syscall_mmap(void* addr, size_t length, int prot, int flags, int fd,
                          unsigned long offset) {
     struct libos_handle* hdl = NULL;
     long ret = 0;
+
+    ret = check_prot(prot);
+    if (ret < 0)
+        return (void*)ret;
 
     if (!(flags & MAP_FIXED) && addr)
         addr = ALLOC_ALIGN_DOWN_PTR(addr);
@@ -130,10 +152,21 @@ void* libos_syscall_mmap(void* addr, size_t length, int prot, int flags, int fd,
         flags &= ~MAP_32BIT;
 #endif
 
+    void* memory_range_start = NULL;
+    void* memory_range_end   = NULL;
+
+    /* Shared mappings of files of "untrusted_shm" type use a different memory range.
+     * See "libos/src/fs/shm/fs.c" for more details. */
+    if ((flags & MAP_SHARED) && hdl && hdl->fs && !strcmp(hdl->fs->name, "untrusted_shm")) {
+        memory_range_start = g_pal_public_state->shared_address_start;
+        memory_range_end = g_pal_public_state->shared_address_end;
+    } else {
+        memory_range_start = g_pal_public_state->memory_address_start;
+        memory_range_end = g_pal_public_state->memory_address_end;
+    }
     if (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) {
         /* We know that `addr + length` does not overflow (`access_ok` above). */
-        if (addr < g_pal_public_state->memory_address_start
-                || (uintptr_t)g_pal_public_state->memory_address_end < (uintptr_t)addr + length) {
+        if (addr < memory_range_start || (uintptr_t)memory_range_end < (uintptr_t)addr + length) {
             ret = -EINVAL;
             goto out_handle;
         }
@@ -186,18 +219,23 @@ void* libos_syscall_mmap(void* addr, size_t length, int prot, int flags, int fd,
         }
     } else {
         /* We know that `addr + length` does not overflow (`access_ok` above). */
-        if (addr && (uintptr_t)g_pal_public_state->memory_address_start <= (uintptr_t)addr
-                && (uintptr_t)addr + length <= (uintptr_t)g_pal_public_state->memory_address_end) {
-            ret = bkeep_mmap_any_in_range(g_pal_public_state->memory_address_start,
-                                          (char*)addr + length, length, prot, flags, hdl, offset,
-                                          NULL, &addr);
+        if (addr && (uintptr_t)memory_range_start <= (uintptr_t)addr
+                && (uintptr_t)addr + length <= (uintptr_t)memory_range_end) {
+            ret = bkeep_mmap_any_in_range(memory_range_start, (char*)addr + length, length, prot,
+                                          flags, hdl, offset, NULL, &addr);
         } else {
             /* Hacky way to mark we had no hit and need to search below. */
             ret = -1;
         }
         if (ret < 0) {
             /* We either had no hinted address or could not allocate memory at it. */
-            ret = bkeep_mmap_any_aslr(length, prot, flags, hdl, offset, NULL, &addr);
+            if (memory_range_start == g_pal_public_state->memory_address_start) {
+                ret = bkeep_mmap_any_aslr(length, prot, flags, hdl, offset, NULL, &addr);
+            } else {
+                /* Shared memory range does not have ASLR. */
+                ret = bkeep_mmap_any_in_range(memory_range_start, memory_range_end, length, prot,
+                                              flags, hdl, offset, NULL, &addr);
+            }
         }
         if (ret < 0) {
             ret = -ENOMEM;
@@ -242,19 +280,9 @@ out_handle:
 }
 
 long libos_syscall_mprotect(void* addr, size_t length, int prot) {
-    if (prot & ~(PROT_NONE | PROT_READ | PROT_WRITE | PROT_EXEC | PROT_GROWSDOWN | PROT_GROWSUP |
-                 PROT_SEM)) {
-        return -EINVAL;
-    }
-
-    if ((prot & (PROT_GROWSDOWN | PROT_GROWSUP)) == (PROT_GROWSDOWN | PROT_GROWSUP)) {
-        return -EINVAL;
-    }
-
-    /* We do not support these flags (at least yet). */
-    if (prot & (PROT_GROWSUP | PROT_SEM)) {
-        return -EOPNOTSUPP;
-    }
+    int ret = check_prot(prot);
+    if (ret < 0)
+        return ret;
 
     /*
      * According to the manpage, addr has to be page-aligned, but not the
@@ -277,7 +305,7 @@ long libos_syscall_mprotect(void* addr, size_t length, int prot) {
     /* `bkeep_mprotect` and then `PalVirtualMemoryProtect` is racy, but it's hard to do it properly.
      * On the other hand if this race happens, it means user app is buggy, so not a huge problem. */
 
-    int ret = bkeep_mprotect(addr, length, prot, /*is_internal=*/false);
+    ret = bkeep_mprotect(addr, length, prot, /*is_internal=*/false);
     if (ret < 0) {
         return ret;
     }
@@ -359,9 +387,9 @@ long libos_syscall_munmap(void* _addr, size_t length) {
     return 0;
 }
 
-/* This emulation of mincore() always tells that pages are _NOT_ in RAM
- * pessimistically due to lack of a good way to know it.
- * Possibly it may cause performance(or other) issue due to this lying.
+/* This emulation of mincore() always pessimistically tells that pages are _NOT_ in RAM due to lack
+ * of a good way to know it.
+ * This lying may possibly cause performance (or other) issues.
  */
 long libos_syscall_mincore(void* addr, size_t len, unsigned char* vec) {
     if (!IS_ALLOC_ALIGNED_PTR(addr))

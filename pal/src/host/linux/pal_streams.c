@@ -37,18 +37,6 @@ int handle_set_cloexec(PAL_HANDLE handle, bool enable) {
     return 0;
 }
 
-/* _PalStreamUnmap for internal use. Unmap stream at certain memory address. The memory is unmapped
- *  as a whole.*/
-int _PalStreamUnmap(void* addr, uint64_t size) {
-    /* Just let the kernel tell us if the mapping isn't good. */
-    int ret = DO_SYSCALL(munmap, addr, size);
-
-    if (ret < 0)
-        return -PAL_ERROR_DENIED;
-
-    return 0;
-}
-
 int handle_serialize(PAL_HANDLE handle, void** data) {
     const void* field = NULL;
     size_t field_size = 0;
@@ -56,17 +44,21 @@ int handle_serialize(PAL_HANDLE handle, void** data) {
     /* find a field to serialize (depends on the handle type); note that
      * no handle type has more than one such field, and some have none */
     switch (handle->hdr.type) {
-        case PAL_TYPE_FILE:
-            field = handle->file.realpath;
-            field_size = strlen(handle->file.realpath) + 1;
-            break;
         case PAL_TYPE_PIPE:
         case PAL_TYPE_PIPESRV:
         case PAL_TYPE_PIPECLI:
             /* pipes have no fields to serialize */
             break;
+        case PAL_TYPE_CONSOLE:
+            /* console (stdin/stdout/stderr) has no fields to serialize */
+            break;
         case PAL_TYPE_DEV:
-            /* devices have no fields to serialize */
+            field = handle->dev.realpath;
+            field_size = strlen(handle->dev.realpath) + 1;
+            break;
+        case PAL_TYPE_FILE:
+            field = handle->file.realpath;
+            field_size = strlen(handle->file.realpath) + 1;
             break;
         case PAL_TYPE_DIR:
             field = handle->dir.realpath;
@@ -110,41 +102,36 @@ int handle_deserialize(PAL_HANDLE* handle, const void* data, size_t size) {
     memcpy(hdl, data, hdl_size);
 
     /* update handle fields to point to correct contents */
+    assert(hdl_size <= size);
     switch (hdl->hdr.type) {
-        case PAL_TYPE_FILE: {
-            assert(hdl_size < size);
-
-            size_t path_size = size - hdl_size;
-            char* path = malloc(path_size);
-            if (!path) {
-                free(hdl);
-                return -PAL_ERROR_NOMEM;
-            }
-
-            memcpy(path, (const char*)data + hdl_size, path_size);
-
-            hdl->file.realpath = path;
-            break;
-        }
         case PAL_TYPE_PIPE:
         case PAL_TYPE_PIPESRV:
         case PAL_TYPE_PIPECLI:
             break;
-        case PAL_TYPE_DEV:
+        case PAL_TYPE_CONSOLE:
             break;
-        case PAL_TYPE_DIR: {
-            assert(hdl_size < size);
-
-            size_t path_size = size - hdl_size;
-            char* path = malloc(path_size);
-            if (!path) {
+        case PAL_TYPE_DEV: {
+            hdl->dev.realpath = alloc_and_copy((const char*)data + hdl_size, size - hdl_size);
+            if (!hdl->dev.realpath) {
                 free(hdl);
                 return -PAL_ERROR_NOMEM;
             }
-
-            memcpy(path, (const char*)data + hdl_size, path_size);
-
-            hdl->dir.realpath = path;
+            break;
+        }
+        case PAL_TYPE_FILE: {
+            hdl->file.realpath = alloc_and_copy((const char*)data + hdl_size, size - hdl_size);
+            if (!hdl->file.realpath) {
+                free(hdl);
+                return -PAL_ERROR_NOMEM;
+            }
+            break;
+        }
+        case PAL_TYPE_DIR: {
+            hdl->dir.realpath = alloc_and_copy((const char*)data + hdl_size, size - hdl_size);
+            if (!hdl->dir.realpath) {
+                free(hdl);
+                return -PAL_ERROR_NOMEM;
+            }
             hdl->dir.buf = hdl->dir.ptr = hdl->dir.end = NULL;
             break;
         }
@@ -219,10 +206,6 @@ int _PalSendHandle(PAL_HANDLE target_process, PAL_HANDLE cargo) {
     message_hdr.msg_iovlen = 1;
 
     ret = DO_SYSCALL(sendmsg, fd, &message_hdr, 0);
-    if (ret < 0) {
-        free(hdl_data);
-        return unix_to_pal_error(ret);
-    }
 
     free(hdl_data);
     return ret < 0 ? unix_to_pal_error(ret) : 0;

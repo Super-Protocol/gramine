@@ -264,7 +264,7 @@ static int chroot_encrypted_mkdir(struct libos_dentry* dent, mode_t perm) {
         ret = pal_to_unix_errno(ret);
         goto out;
     }
-    PalObjectClose(palhdl);
+    PalObjectDestroy(palhdl);
 
     inode->type = S_IFDIR;
     inode->perm = perm;
@@ -298,7 +298,7 @@ static int chroot_encrypted_unlink(struct libos_dentry* dent) {
     }
 
     ret = PalStreamDelete(palhdl, PAL_DELETE_ALL);
-    PalObjectClose(palhdl);
+    PalObjectDestroy(palhdl);
     if (ret < 0) {
         ret = pal_to_unix_errno(ret);
         goto out;
@@ -342,7 +342,6 @@ static int chroot_encrypted_chmod(struct libos_dentry* dent, mode_t perm) {
     assert(dent->inode);
 
     char* uri = NULL;
-    lock(&dent->inode->lock);
 
     int ret = chroot_dentry_uri(dent, dent->inode->type, &uri);
     if (ret < 0)
@@ -358,18 +357,29 @@ static int chroot_encrypted_chmod(struct libos_dentry* dent, mode_t perm) {
     mode_t host_perm = HOST_PERM(perm);
     PAL_STREAM_ATTR attr = {.share_flags = host_perm};
     ret = PalStreamAttributesSetByHandle(palhdl, &attr);
-    PalObjectClose(palhdl);
+    PalObjectDestroy(palhdl);
     if (ret < 0) {
         ret = pal_to_unix_errno(ret);
         goto out;
     }
-    dent->inode->perm = perm;
     ret = 0;
 
 out:
-    unlock(&dent->inode->lock);
     free(uri);
     return ret;
+}
+
+static int chroot_encrypted_fchmod(struct libos_handle* hdl, mode_t perm) {
+    assert(hdl->inode);
+
+    struct libos_encrypted_file* enc = hdl->inode->data;
+    mode_t host_perm = HOST_PERM(perm);
+    PAL_STREAM_ATTR attr = {.share_flags = host_perm};
+    int ret = PalStreamAttributesSetByHandle(enc->pal_handle, &attr);
+    if (ret < 0)
+        return pal_to_unix_errno(ret);
+
+    return 0;
 }
 
 static int chroot_encrypted_flush(struct libos_handle* hdl) {
@@ -441,17 +451,28 @@ static ssize_t chroot_encrypted_write(struct libos_handle* hdl, const void* buf,
     lock(&hdl->inode->lock);
 
     int ret = encrypted_file_write(enc, buf, count, *pos, &actual_count);
-    if (ret < 0)
-        goto out;
+    if (ret < 0) {
+        unlock(&hdl->inode->lock);
+        return ret;
+    }
 
     assert(actual_count <= count);
     *pos += actual_count;
     if (hdl->inode->size < *pos)
         hdl->inode->size = *pos;
 
-out:
     unlock(&hdl->inode->lock);
-    return actual_count;
+
+    /* If there are any MAP_SHARED mappings for the file, this will read data from `enc`. */
+    if (__atomic_load_n(&hdl->inode->num_mmapped, __ATOMIC_ACQUIRE) != 0) {
+        ret = reload_mmaped_from_file_handle(hdl);
+        if (ret < 0) {
+            log_error("reload mmapped regions of file failed: %s", unix_strerror(ret));
+            BUG();
+        }
+    }
+
+    return (ssize_t)actual_count;
 }
 
 static int chroot_encrypted_truncate(struct libos_handle* hdl, file_off_t size) {
@@ -487,6 +508,7 @@ struct libos_fs_ops chroot_encrypted_fs_ops = {
     .migrate    = &chroot_encrypted_migrate,
     .mmap       = &generic_emulated_mmap,
     .msync      = &generic_emulated_msync,
+    .fchmod     = &chroot_encrypted_fchmod,
 };
 
 struct libos_d_ops chroot_encrypted_d_ops = {

@@ -5,7 +5,6 @@
  * This file contains implementation of checkpoint and restore.
  */
 
-#include <asm/mman.h>
 #include <stdarg.h>
 #include <stdint.h>
 
@@ -17,6 +16,7 @@
 #include "libos_thread.h"
 #include "libos_utils.h"
 #include "libos_vma.h"
+#include "linux_abi/memory.h"
 #include "list.h"
 #include "pal.h"
 
@@ -659,7 +659,7 @@ out:
     }
 
     if (pal_process)
-        PalObjectClose(pal_process);
+        PalObjectDestroy(pal_process);
 
     if (ret < 0) {
         log_error("process creation failed");
