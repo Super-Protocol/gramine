@@ -26,15 +26,11 @@
 #include "path_utils.h"
 #include "perm.h"
 #include "util.h"
-#include <pthread.h>
 
 /* High-level protected files helper functions. */
 
 /* PF callbacks usable in a standard Linux environment.
    Assume that pf handle is a pointer to file's fd. */
-
-
-static pthread_mutex_t g_pf_lock;
 
 static pf_status_t linux_read(pf_handle_t handle, void* buffer, uint64_t offset, size_t size) {
     int fd = *(int*)handle;
@@ -190,14 +186,10 @@ static mbedtls_entropy_context g_entropy;
 static mbedtls_ctr_drbg_context g_prng;
 
 static pf_status_t mbedtls_random(uint8_t* buffer, size_t size) {
-    pthread_mutex_lock(&g_pf_lock);
-    int ret = mbedtls_ctr_drbg_random(&g_prng, buffer, size);
-    pthread_mutex_unlock(&g_pf_lock);
-    if (ret != 0) {
+    if (mbedtls_ctr_drbg_random(&g_prng, buffer, size) != 0) {
         ERROR("Failed to get random bytes\n");
         return PF_STATUS_CALLBACK_FAILED;
     }
-
     return PF_STATUS_SUCCESS;
 }
 
