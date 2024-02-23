@@ -979,6 +979,8 @@ int PalAttestationQuote(const void* user_report_data, size_t user_report_data_si
  */
 int PalGetSpecialKey(const char* name, void* key, size_t* key_size);
 
+int PalGetTrustedFileHash(const char* path, uint8_t** hash, size_t* hash_size);
+
 #define PAL_KEY_NAME_SGX_MRENCLAVE "_sgx_mrenclave"
 #define PAL_KEY_NAME_SGX_MRSIGNER  "_sgx_mrsigner"
 

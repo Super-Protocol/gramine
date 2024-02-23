@@ -154,17 +154,106 @@ static void cb_debug(const char* msg) {
 }
 #endif
 
+static bool encrypted_file_check_hash(pf_context_t* pf, const uint8_t *file_hash)
+{
+    assert(pf);
+    assert(file_hash);
+
+    uint64_t file_size = 0u;
+    pf_get_size(pf, &file_size);
+
+    LIB_SHA256_CONTEXT file_sha;
+    int ret = lib_SHA256Init(&file_sha);
+    if (ret < 0) {
+        log_error("Error during hash initialization");
+        return false;
+    }
+
+    uint64_t offset = 0;
+    size_t bytes_read = 0;
+    pf_status_t pfs = PF_STATUS_SUCCESS;
+    uint8_t buffer[PF_NODE_SIZE];
+
+    while (true) {
+        uint64_t chunk_size = MIN(file_size - offset, PF_NODE_SIZE);
+        if (chunk_size == 0) {
+            break;
+        }
+
+        pfs = pf_read(pf, offset, chunk_size, buffer, &bytes_read);
+        if (bytes_read != chunk_size) {
+            pfs = PF_STATUS_CORRUPTED;
+        }
+
+        if (PF_FAILURE(pfs)) {
+            log_error("Read from protected file failed (offset %lu, size %lu): %s\n",
+                      offset, chunk_size, pf_strerror(pfs));
+            return false;
+        }
+
+        ret = lib_SHA256Update(&file_sha, buffer, chunk_size);
+        if (ret < 0) {
+            log_error("Error during hash update");
+            return false;
+        }
+
+        offset += bytes_read;
+    }
+
+    uint8_t pf_file_hash[SHA256_DIGEST_LEN];
+    ret = lib_SHA256Final(&file_sha, pf_file_hash);
+
+    if (memcmp(pf_file_hash, file_hash, sizeof(pf_file_hash))) {
+        return false;
+    }
+
+    return true;
+}
+
 /*
  * The `pal_handle` parameter is used if this is a checkpointed file, and we have received the PAL
  * handle from the parent process. Note that in this case, it would not be safe to attempt opening
  * the file again in the child process, as it might actually be deleted on host.
  */
 static int encrypted_file_internal_open(struct libos_encrypted_file* enc, PAL_HANDLE pal_handle,
-                                        bool create, pal_share_flags_t share_flags) {
+                                        bool create, enum pal_access access, pal_share_flags_t share_flags) {
     assert(!enc->pf);
 
     int ret;
     char* normpath = NULL;
+
+    assert(strstartswith(enc->uri, URI_PREFIX_FILE));
+    const char* path = enc->uri + static_strlen(URI_PREFIX_FILE);
+
+    size_t normpath_size = strlen(path) + 1;
+    normpath = malloc(normpath_size);
+    if (!normpath) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    ret = get_norm_path(path, normpath, &normpath_size);
+    if (ret < 0) {
+        ret = pal_to_unix_errno(ret);
+        goto out;
+    }
+
+    uint8_t *hash = NULL;
+    if (!strcmp(g_pal_public_state->host_type, "Linux-SGX")) {
+        size_t hash_size = 0;
+        int res = PalGetTrustedFileHash(normpath, &hash, &hash_size) ;
+        if (PF_FAILURE(res)) {
+            ret = -EACCES;
+            goto out;
+        } else if (hash != NULL) {
+            assert(hash_size == SHA256_DIGEST_LEN);
+            if (create || (access == PAL_ACCESS_RDWR) || (access == PAL_ACCESS_WRONLY)) {
+                log_error("Disallowing create/write/append to a protected file '%s' with fixed hash", normpath);
+                ret = -EACCES;
+                goto out;
+            }
+        }
+    }
 
     if (!pal_handle) {
         enum pal_create_mode create_mode = create ? PAL_CREATE_ALWAYS : PAL_CREATE_NEVER;
@@ -185,21 +274,6 @@ static int encrypted_file_internal_open(struct libos_encrypted_file* enc, PAL_HA
     }
     size_t size = pal_attr.pending_size;
 
-    assert(strstartswith(enc->uri, URI_PREFIX_FILE));
-    const char* path = enc->uri + static_strlen(URI_PREFIX_FILE);
-
-    size_t normpath_size = strlen(path) + 1;
-    normpath = malloc(normpath_size);
-    if (!normpath) {
-        ret = -ENOMEM;
-        goto out;
-    }
-
-    if (!get_norm_path(path, normpath, &normpath_size)) {
-        ret = -EINVAL;
-        goto out;
-    }
-
     pf_context_t* pf;
     lock(&g_keys_lock);
     if (!enc->key->is_set) {
@@ -208,12 +282,20 @@ static int encrypted_file_internal_open(struct libos_encrypted_file* enc, PAL_HA
         ret = -EACCES;
         goto out;
     }
-    pf_status_t pfs = pf_open(pal_handle, normpath, size, PF_FILE_MODE_READ | PF_FILE_MODE_WRITE,
-                              create, &enc->key->pf_key, &pf);
+
+    pf_status_t pfs = pf_open(pal_handle, normpath, size, PF_FILE_MODE_READ | PF_FILE_MODE_WRITE, create, &enc->key->pf_key, &pf);
+
     unlock(&g_keys_lock);
     if (PF_FAILURE(pfs)) {
         log_warning("pf_open failed: %s", pf_strerror(pfs));
         ret = -EACCES;
+        goto out;
+    }
+
+    if (!strcmp(g_pal_public_state->host_type, "Linux-SGX") && hash && !encrypted_file_check_hash(pf, hash)) {
+        log_error("Hash of trusted/protected file '%s' does not match with the reference hash in manifest", enc->uri);
+        ret = -EACCES;
+        pf_close(pf);
         goto out;
     }
 
@@ -222,7 +304,7 @@ static int encrypted_file_internal_open(struct libos_encrypted_file* enc, PAL_HA
     ret = 0;
 out:
     free(normpath);
-    if (ret < 0)
+    if (ret < 0 && !!pal_handle)
         PalObjectDestroy(pal_handle);
     return ret;
 }
@@ -472,14 +554,14 @@ static int encrypted_file_alloc(const char* uri, struct libos_encrypted_files_ke
 }
 
 int encrypted_file_open(const char* uri, struct libos_encrypted_files_key* key,
-                        struct libos_encrypted_file** out_enc) {
+                        struct libos_encrypted_file** out_enc, enum pal_access access) {
     struct libos_encrypted_file* enc;
     int ret = encrypted_file_alloc(uri, key, &enc);
     if (ret < 0)
         return ret;
 
     ret = encrypted_file_internal_open(enc, /*pal_handle=*/NULL, /*create=*/false,
-                                       /*share_flags=*/0);
+                                       /*access=*/access, /*share_flags=*/0);
     if (ret < 0) {
         encrypted_file_destroy(enc);
         return ret;
@@ -490,13 +572,13 @@ int encrypted_file_open(const char* uri, struct libos_encrypted_files_key* key,
 }
 
 int encrypted_file_create(const char* uri, mode_t perm, struct libos_encrypted_files_key* key,
-                          struct libos_encrypted_file** out_enc) {
+                          struct libos_encrypted_file** out_enc, enum pal_access access) {
     struct libos_encrypted_file* enc;
     int ret = encrypted_file_alloc(uri, key, &enc);
     if (ret < 0)
         return ret;
 
-    ret = encrypted_file_internal_open(enc, /*pal_handle=*/NULL, /*create=*/true, perm);
+    ret = encrypted_file_internal_open(enc, /*pal_handle=*/NULL, /*create=*/true, /*access=*/access, perm);
     if (ret < 0) {
         encrypted_file_destroy(enc);
         return ret;
@@ -514,7 +596,7 @@ void encrypted_file_destroy(struct libos_encrypted_file* enc) {
     free(enc);
 }
 
-int encrypted_file_get(struct libos_encrypted_file* enc) {
+int encrypted_file_get(struct libos_encrypted_file* enc, enum pal_access access) {
     if (enc->use_count > 0) {
         assert(enc->pf);
         enc->use_count++;
@@ -522,7 +604,7 @@ int encrypted_file_get(struct libos_encrypted_file* enc) {
     }
     assert(!enc->pf);
     int ret = encrypted_file_internal_open(enc, /*pal_handle=*/NULL, /*create=*/false,
-                                           /*share_flags=*/0);
+                                           /*access=*/access, /*share_flags=*/0);
     if (ret < 0)
         return ret;
     enc->use_count++;
@@ -795,7 +877,7 @@ BEGIN_RS_FUNC(encrypted_file) {
     if (enc->use_count > 0) {
         assert(enc->pal_handle);
         int ret = encrypted_file_internal_open(enc, enc->pal_handle, /*create=*/false,
-                                               /*share_flags=*/0);
+                                               /*access=*/PAL_ACCESS_RDONLY, /*share_flags=*/0);
         if (ret < 0)
             return ret;
     } else {
